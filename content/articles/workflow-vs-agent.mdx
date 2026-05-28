@@ -4,12 +4,227 @@ slug: "workflow-vs-agent"
 cluster: "foundations"
 order: 2
 prerequisites: ["what-is-agent"]
-estimatedMinutes: 10
-summary: "控制权分水岭：代码调度 vs 模型自主决策"
+estimatedMinutes: 12
+summary: "控制权分水岭：代码调度 vs 模型自主决策 — 以及五种 workflow 的样子"
 widgets: []
 updated: "2026-05-28"
+references:
+  - id: anthropic2024agents
+    authors: "Schluntz, E. & Zhang, B. (Anthropic)"
+    year: 2024
+    title: "Building Effective Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/research/building-effective-agents"
 ---
 
 # Workflow vs Agent
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+上一篇 [[what-is-agent]] 把 augmented LLM 拼成了一个 `while llm(history)` 循环，但留了一个尾巴：**augmented LLM 不一定算 agent**。同样是「带工具的 LLM」，有的系统业界叫它 workflow，有的叫它 agent — 这条边界到底画在哪儿？
+
+Anthropic 在 *Building Effective Agents*<Cite id="anthropic2024agents" /> 里给出了一条非常具体的判定标准。理解这条线是这一篇的核心 — 一旦你能在任何一段代码上把这条线画清楚，你就掌握了「这个系统是 workflow 还是 agent」的判定能力，也掌握了「该不该上 agent」的决策能力。
+
+## 1. 真正的分水岭：下一步由谁决定
+
+Anthropic 把所有「用了 LLM + 工具」的系统统称为 **agentic systems**（agentic 系统），但在里面划了一条架构上的硬线：
+
+> **Definition (Workflow vs Agent)**：
+> - **Workflows** are systems where LLMs and tools are orchestrated through **predefined code paths**.
+> - **Agents** are systems where LLMs **dynamically direct their own processes and tool usage**, maintaining control over how they accomplish tasks.
+>
+> **中文释义**：
+> - **Workflow（工作流）**：LLM 和工具被**预先写死的代码路径**编排。流程是你（程序员）定的，LLM 只是流水线上被调用的一个零件
+> - **Agent（智能体）**：LLM **自己动态地决定流程和工具调用**，对"怎么完成任务"保有控制权
+
+用一句话记住这条线：
+
+> **控制流（control flow）写在代码里 → workflow。**
+> **控制流由模型在运行时生成 → agent。**
+
+把上一篇 agent loop 和一个典型 workflow 摆在一起对比：
+
+```python title="workflow.py · 控制权在代码"
+def handle_ticket(user_message):
+    category = llm_classify(user_message)  # 模型只参与"分类"这一步
+    if category == "refund":                # 流程分支由 Python 决定
+        return llm_refund_flow(user_message)
+    elif category == "tech_support":
+        return llm_tech_flow(user_message)
+    else:
+        return llm_general_flow(user_message)
+```
+
+```python title="agent.py · 控制权在模型"
+def agent(task):
+    history = [task]
+    while True:
+        step = llm(history)               # 模型自己生成"下一步"
+        if step.is_final_answer:          # 它自己判断"完事了吗"
+            return step.answer
+        result = execute(step.tool_call)
+        history.append(step)
+        history.append(result)
+```
+
+两段都"用了 LLM"，都"用了工具"，但执行路径的来源完全不同：
+
+- **workflow.py** 的路径是你画好的 — if-else 是 Python 在 runtime 之前就决定的。LLM 只是"在节点上做判断"
+- **agent.py** 的路径是 LLM **边走边画** — 它可能调 0 次工具就给答案，也可能调 17 次。下一步是什么完全在循环里临场生成
+
+> [!important] 一行代码判定
+> 看一段 LLM-based 代码是 workflow 还是 agent，找最关键的一行：**控制流走向是 if-else / for（写死）还是 `llm(history)` 决定**。
+>
+> 找到这一行，判定就出来了。
+
+## 2. 为什么这条线如此重要 — 而不是抠字眼
+
+这不是术语游戏。**控制流由谁决定**这件事，直接决定了系统的**可预测性 vs 灵活性**，这是个真实的工程权衡。
+
+### Workflow 这一侧：可预测，但僵硬
+
+优点：
+- 你知道它一定先分类、再走某条分支，**出了问题好 debug**
+- 每条路径的成本和延迟可控、可压测
+- 容易写单元测试 — 每个分支可以单独 mock
+
+代价：
+- 遇到你**没预料到的输入**，没有对应分支，它就傻了
+- 加新功能要改代码 — 加一个"退货换货"分类要改 if-else
+
+典型场景：客服票分发、报销审批、固定模板的内容生成 — 任务形状你提前知道。
+
+### Agent 这一侧：灵活，但失控风险
+
+优点：
+- 遇到**开放式任务**（改一个 bug 要动几个文件？事先不知道），能自己摸索
+- 加新能力只要给个新工具，不用改主循环代码
+
+代价：
+- 可能多绕路、烧更多 token、错误会**滚雪球**（compounding errors — 第 5 步的错决定了第 6 步的输入）
+- 更难 debug — 同一个 task 跑两次轨迹可能完全不同
+- 成本和延迟难以预先估算
+
+典型场景：coding agent（SWE-bench 任务）、computer use、研究 / 搜索任务 — 任务步数无法预先确定。
+
+> [!tip] Anthropic 的工程纪律（原文立场）
+> "Find the simplest solution possible, and only increasing complexity when needed."
+>
+> **能用最简单的方案就用最简单的**，只在确实需要时才加复杂度。很多场景**单次 LLM 调用 + 检索 + 几个 few-shot example 就够了**，根本不用上 workflow，更不用上 agent。
+>
+> Agent 是用「延迟和成本」换「任务表现」。想清楚这笔交易划不划算，再决定要不要上。
+
+这条立场会在 [[multi-agent-debate]]（要不要上多 agent）和 [[evaluation]]（怎么评估值不值）反复回来。
+
+## 3. Workflow 不是一种 — 它有五种常见形状
+
+既然 workflow 是"人把路径写死"，那常见的路径形状有哪几种？Anthropic 总结了五个。你不用现在背，但要知道它们存在 — 因为**agent 内部经常嵌着这些 workflow 模式**。
+
+| # | 模式 | 一句话描述 | 典型场景 |
+|---|---|---|---|
+| 1 | **Prompt Chaining**（链式） | 拆成固定步骤，上一步输出喂下一步 | 先写大纲 → 检查大纲 → 再按大纲写正文 |
+| 2 | **Routing**（路由） | 先分类，再分发到各自专门的分支 | 客服：退款/技术/咨询走不同 prompt 和工具 |
+| 3 | **Parallelization**（并行） | 拆成独立子任务同时跑，或同一任务多次投票 | 一个模型答题、另一个并行做内容审核 |
+| 4 | **Orchestrator-Workers**（编排者-工人） | 中央 LLM 临时**拆**任务、派给 worker、再**汇总**结果 — 但「拆→派→汇总」这个骨架是固定的 | 改代码：要动几个文件由 orchestrator 临场决定 |
+| 5 | **Evaluator-Optimizer**（评估-优化） | 一个生成、另一个打分反馈、循环改进 | 翻译：译者 LLM 出稿，评审 LLM 提意见重译 |
+
+### 一个最容易混的模式：Orchestrator-Workers
+
+第 4 种 — Orchestrator-Workers — **看起来很像 agent**，因为中央 LLM 在"动态拆任务"。这里要把界线画清楚：
+
+> [!warning] Orchestrator-Workers 仍然是 workflow，不是 agent
+> 区别在于 — orchestrator 的**整体骨架**（有一个 orchestrator、它把活分给 workers、最后汇总）还是**你写死的**：
+>
+> ```python
+> def orchestrator_workflow(task):
+>     subtasks = orchestrator_llm.decompose(task)   # 拆任务由 LLM 做（看起来像 agent）
+>     results = [worker_llm(subtask) for subtask in subtasks]  # 但"拆→派→汇总"骨架是你写的
+>     return orchestrator_llm.aggregate(results)
+> ```
+>
+> agent 是连这个骨架都由模型决定 — 它可能根本不拆，也可能拆 5 层，也可能拆完发现不对又重拆。
+>
+> 这条区别在 [[multi-agent-debate]] 会变成核心争论 — Anthropic 派和 Cognition 派对"多 agent 应该是 orchestrator-workers workflow 还是真正的多 agent"的分歧。
+
+### 这五种 workflow 和 agent 的关系
+
+Agent 内部经常嵌着这些 workflow 模式 — 比如一个 coding agent 可能在内部用 prompt chaining 来"先列计划再执行"（这就是 [[plan-and-solve]] 范式），或者用 evaluator-optimizer 来"自己审自己的代码再改"（这就是 [[reflexion]] 范式）。
+
+记住这五个名字，后面会反复看到。
+
+## 4. 什么时候**不该**上 agent
+
+学 agent 的人最容易犯的错：**什么都想用 agent**。Anthropic 给了清晰的边界。
+
+### 该上 agent 的场景
+
+- 开放式问题、**步数无法预先确定**
+- 不能硬编码固定路径
+- 你对它的决策有一定信任（不是完全黑盒）
+- 运行在受信任的沙盒环境里（agent 会做你预料不到的事）
+
+典型：coding agent（改 SWE-bench 任务，要动几个文件事先不知道）、computer use、深度研究 / 调研任务。
+
+### 不该上 agent 的场景
+
+- 任务能被干净拆成固定子步骤 → 用 workflow（prompt chaining）就好，更可预测
+- 只是要更准的单次回答 → 优化单次 prompt + 检索 + few-shot examples 往往就够
+- 对延迟和成本敏感、且错误代价高 → agent 的自主性意味着更高成本 + 错误滚雪球，要极度谨慎
+
+> [!tip] 一句话决策树
+> 从最简单的方案起步，**只有当简单方案被证明不够用时，才加一层复杂度**。
+>
+> - 单次回答能搞定 → 别上 workflow
+> - workflow 能搞定 → 别上 agent
+> - 步数能预先确定 → workflow 给你可预测性
+> - 步数不能预先确定 → agent 给你灵活性
+
+## 5. 一个具体的练习：判一段代码
+
+把这条线练熟。下面三段代码，哪个是 workflow，哪个是 agent？
+
+**代码 A**：
+
+```python
+def fix_bug(error_msg):
+    file_to_fix = llm_identify_file(error_msg)
+    bug_location = llm_locate_bug(file_to_fix, error_msg)
+    fix = llm_generate_fix(file_to_fix, bug_location)
+    apply_fix(file_to_fix, fix)
+    return run_tests()
+```
+
+**代码 B**：
+
+```python
+def fix_bug(error_msg):
+    history = [error_msg]
+    while True:
+        step = llm(history)
+        if step.is_done: return step.summary
+        result = execute_tool(step.tool_call)  # read_file / write_file / run_tests
+        history += [step, result]
+```
+
+**代码 C**：
+
+```python
+def fix_bug(error_msg):
+    plan = llm_make_plan(error_msg)            # LLM 出一个 N 步的计划
+    for step in plan.steps:                     # 按计划循环
+        result = execute_tool(step.tool_call)
+        if not result.success:
+            return "Failed at " + step.name
+    return "Done"
+```
+
+> [!example] 答案
+> - **A 是 workflow（prompt chaining）** — 四步固定流程：找文件 → 找位置 → 生成修复 → 跑测试。LLM 只在每个节点做判断，路径是你写的
+> - **B 是 agent** — `while llm(history)` 经典骨架。下一步是模型生成的，调几次工具完全在循环里决定
+> - **C 是 workflow（orchestrator-workers 的变体）** — 看起来"动态"，因为 plan 是 LLM 出的。但 plan 一旦生成，**执行是按 plan 写死的 for loop**。如果 step 3 执行后发现 step 4 走不通，它没有能力重新规划 — 这正是 [[plan-and-solve]] 这个范式的局限，也是为什么 [[react-core]] 那种"边走边决定"的 agent 范式更通用
+
+判定的核心永远在一句话：**控制流的下一个分支，是 if-else 决定的，还是 `llm(history)` 决定的？**
+
+---
+
+到这里，「是 workflow 还是 agent」这条边界你已经能在任何一段代码上画出来了。但还有一个问题没拆 — **agent 内部到底长什么样**？
+
+`while llm(history)` 只是一个骨架。骨架里面具体有哪些组件？模型大脑、调用工具的接口、保存历史的 memory、决定何时停的逻辑 — 这些零件怎么互相调用？这是下一篇 [[agent-architecture]] 要回答的。学界和工业界各有一套常用的切法，两套都要会 — 因为不同文章默认用不同切法，混着读会很乱。下一篇把两套都讲清楚，并告诉你什么时候用哪个。

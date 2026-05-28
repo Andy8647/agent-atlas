@@ -4,77 +4,160 @@ slug: "what-is-agent"
 cluster: "foundations"
 order: 1
 prerequisites: []
-estimatedMinutes: 8
-summary: "从 stateless function 到 agent 主循环"
+estimatedMinutes: 10
+summary: "从 stateless function 到 agent 主循环 — 把'agent 到底是什么'这条线找准"
 widgets: []
 updated: "2026-05-28"
+references:
+  - id: anthropic2024agents
+    authors: "Schluntz, E. & Zhang, B. (Anthropic)"
+    year: 2024
+    title: "Building Effective Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/research/building-effective-agents"
+  - id: weng2023agents
+    authors: "Weng, L."
+    year: 2023
+    title: "LLM Powered Autonomous Agents"
+    venue: "lilianweng.github.io"
+    url: "https://lilianweng.github.io/posts/2023-06-23-agent/"
 ---
 
 # 什么是 Agent
 
-> 本节是整门课程的地基。我们从最朴素的 LLM 调用出发，一步步推导出 agent 的核心定义。
+整套讲义的目标不是让你背一个 agent 的定义。目标是让你回答一个具体问题：**你手上这段代码，到底算不算一个 agent？它和你已经会写的「调一次 API 拼一个 prompt」差在哪一条线上？**
 
-## 0.1 从 stateless function 出发
+这条线找准了，后面 11 节文章全是在这条线之内往深里走。如果模糊地知道"agent 就是会用工具的 LLM"，每读到一个新概念你都会觉得它来得突兀；线找准了，所有新概念都会自然挂上去。
 
-最简单的 LLM 调用长什么样？
+## 1. 你已经会的东西：一次 API 调用是什么
 
-```python
-response = llm("法国的首都是哪里?")
-print(response)  # "巴黎"
-```
-
-这是一个 **stateless function**（无状态函数）：输入 → 黑盒 → 输出。没有任何"中间步骤"或"持续对话"的概念。
-
-这个模型有三个洞（三个它做不了的事）：
-1. **训练数据截止**——不知道今天发生了什么
-2. **一次执行、无纠错**——不能自我修正
-3. **不能向外部请求**——不能 Google、不能算、不能查数据库
-
-## 0.2 填第一个洞：外部知识
-
-给模型送进一个问题，然后**把外部结果接入它的生成流**：
-
-```text
-User: 帮我查 Python 3.14 什么时候发布？
-
-# 模型无法回答（训练数据里没有这个信息）
-
-# 给它一个工具！
-Function call: web_search("Python 3.14 release date")
-Result: "Python 3.14 was released on October 7, 2025."
-
-# 把结果放回 prompt
-Assistant: Python 3.14 于 2025 年 10 月 7 日发布。
-```
-
-这就叫 **augmented LLM**（增强版 LLM）：模型 + 工具调用能力。
-
-## 0.3 Agent 主循环
-
-把 augmented LLM 放在一个 **while 循环**里，就是 agent 的最小内核：
+你现在写的最普通的 LLM 调用，本质是一个**无状态函数（stateless function）**：
 
 ```python
-history = [system_prompt, user_task]
-
-while not done:
-    # ① 模型看着历史，决定下一步做什么
-    step = llm(history)
-
-    # ② 如果是 tool_call，执行；如果是最终回答，结束
-    if step.is_tool_call:
-        result = execute_tool(step.tool_name, step.args)
-        history.append(step)
-        history.append({"role": "tool", "content": result})
-    else:
-        return step.content  # 最终回答
+prompt = "法国的首都是哪里？"
+response = openai.chat.completions.create(
+    model="gpt-4",
+    messages=[{"role": "user", "content": prompt}],
+)
+print(response.choices[0].message.content)  # → "巴黎"
 ```
 
-这四个关注点——**① 怎么推理下一步、② 怎么用工具、③ 怎么管理越来越长的 history、④ 怎么知道该停了**——就是后面对应 L1 到 L11 的主线。
+输入一段文字，吐一段文字。同样的输入（加上同样的随机种子）给同样的输出。它**不记得**上一次你问过什么，**不能**在回答到一半时跑去查个网页，也**不会**在发现自己答错后停下来重来。它就是一个非常强的"文本补全器"。
 
-## 关键定义
+这件事必须先钉死，因为整本讲义后面所有的复杂度，都是在补这个函数的**三个洞**：
 
-> **Agent** = LLM + Tool Use + While Loop + Context Management
+1. **它只知道训练时见过的东西** — 问它"今天的汇率"它只能编一个出来
+2. **它不能执行任何动作** — 它能写出删文件的 Python 代码，但它自己删不了你的文件
+3. **它是一锤子买卖** — 一次输入一次输出，没有"走了一步、看看结果、再决定下一步"的过程
+
+> [!note] 一个用词小澄清：agent vs agentic
+> 你会反复看到两个词：**agent**（智能体）和 **agentic**（智能体式的，形容词）。
 >
-> 中文释义：让模型在一个循环里，看着历史（上下文），自主决定每一步是调用工具还是输出结果。
+> - `agent` 指的是**系统本身** — "我做了一个 coding agent"
+> - `agentic` 是形容某种**风格或特性** — "这是个 agentic system"、"agentic behavior"
+>
+> Anthropic 用 `agentic systems` 作为一个大伞，**workflow 和 agent 都属于 agentic systems** — 都是"用 LLM 做出有自主性行为的系统"。但只有真正让 LLM 自己掌控流程的子集，才叫 agent。两个词意思相关但范围不同，看清这点你就不会再混。
 
-这个定义里的四个分量，就是整个课程要逐一拆解的对象。
+> [!note] 为什么从「洞」讲起，不从「三件套」讲起
+> 大部分关于 agent 的文章一上来就抛三件套 — planning（规划）/ memory（记忆）/ tool use（工具调用） — 然后挨个解释每件是什么。这样讲你能学到名词，但学不到结构。
+>
+> 反过来才对：先认清洞，再看每件挂件补哪个洞。这样你看到任何新的 agent 技术，都能自动归位到「它在补哪个洞」，而不是当成一个孤立的新概念。
+
+## 2. 补洞第一步：把函数升级成「带挂件的 LLM」
+
+补洞最直接的办法，是 Anthropic 在 *Building Effective Agents*<Cite id="anthropic2024agents" /> 里命名的「最基础的积木」。一个朴素的画面：把 LLM 想象成一个光秃秃的人形挂衣架，你在它身上挂三个口袋 — **检索口袋**装"它需要查的资料"，**工具口袋**装"它能调用的函数"，**记忆口袋**装"它要带走的笔记"。原文是这么定义这种"挂了口袋的 LLM"的：
+
+> **Definition (Augmented LLM)**：The basic building block of agentic systems is an LLM enhanced with augmentations such as **retrieval**, **tools**, and **memory**. Our current models can actively use these capabilities — generating their own search queries, selecting appropriate tools, and determining what information to retain.
+>
+> **中文释义**：agentic 系统最基础的积木，是一个被"增强"过的 LLM — 给它接上**检索（retrieval）**、**工具（tools）**、**记忆（memory）** 三类挂件。今天的模型已经能主动用这些挂件：自己生成搜索 query、自己选用哪个工具、自己决定记住什么。
+
+把三个洞和三个挂件对照一下：
+
+| 洞 | 挂件 | 怎么补 |
+|---|---|---|
+| 只知道训练数据 | retrieval（检索） | 临时把外部信息塞进 context — 查到的网页、文档片段、知识库条目 |
+| 不能执行动作 | tools（工具） | 给它一组能调用的函数（查天气、跑代码、读文件） |
+| 一锤子买卖 | memory（记忆） | 让它跨步、跨轮次保留信息，比如对话历史、长期偏好 |
+
+> [!important] 一个容易被略过、但关键的措辞
+> 上面定义里有一句：「模型**主动**生成 query、**主动**选用工具」。
+>
+> 挂件本身只是把"能力"摆在桌上 — 库里有什么工具、内存里有什么记忆 — 但**谁来决定什么时候伸手去拿、伸哪一只手**，定义里没说。
+>
+> 这恰恰是下一篇 [[workflow-vs-agent]] 那条**真正的分水岭**。Augmented LLM 还不一定是 agent，要不要算 agent，看的不是"挂了几样挂件"，而是"由谁来调度这些挂件"。
+
+## 3. Agent 的内核：一个 while 循环
+
+Augmented LLM 是积木。把积木拼成 agent，需要再加一层 — **把 LLM 调用放进一个循环里，让它根据上一步的反馈决定下一步**。Anthropic 的原话直接戳到本质：
+
+> **Definition (Agents)**：Agents are typically just **LLMs using tools based on environmental feedback in a loop**.
+>
+> **中文释义**：Agent 通常就是 — **LLM 在一个循环里，基于环境反馈来使用工具**。
+
+最小骨架长这样（这就是后面 [[harness-loop]] 要讲的 harness 主循环的雏形）：
+
+```python title="agent 的最小骨架"
+def agent(task):
+    history = [task]
+    while True:
+        step = llm(history)              # ① 模型看着历史，生成"下一步做什么"
+        if step.is_final_answer:         # ② 模型自己判断：完事了吗？
+            return step.answer
+        result = execute(step.tool_call) # ③ 真正去环境里执行，拿到 ground truth
+        history.append(step)             # ④ 把这一步和结果都记进历史
+        history.append(result)           #    下一轮循环，模型基于更新后的历史再决定
+```
+
+只有 8 行代码。但这 8 行里每一行都藏着后面整本讲义要解决的一个具体问题：
+
+| 行号 | 这一步要回答的问题 | 后面哪节展开 |
+|------|------|------|
+| ① 模型生成下一步 | 模型具体怎么决定下一步？不是让它"自由发挥"那么简单 | 单 Agent 范式（cluster 2） |
+| ② 自己判断完没完 | 它怎么知道自己该停了？停不下来无限循环怎么办？ | Harness 主循环（cluster 5） |
+| ③ 调工具拿真实结果 | 工具该怎么设计才能让模型用对？真实结果回填要注意什么？ | 工具与记忆（cluster 3） |
+| ④ 把这步记进历史 | 历史越滚越长怎么办？该塞什么、何时丢？ | 上下文工程（cluster 4） |
+
+> [!important] 一个反直觉的结论
+> Agent 难，不难在这个循环本身 — 循环骨架 8 行就写完了。
+>
+> 难在让模型在循环的每一轮都做出靠谱的决定：工具描述要让它看得懂、历史不能喂脏（错误信息一旦进 history 就洗不掉）、context 不能让关键信息被噪声淹没。这三件事分别对应后面三个 cluster，每件都要花几节文章拆开看。
+>
+> 整本讲义的大头不在「agent 框架代码怎么写」，而在「**怎么让循环里那一步 `llm(history)` 不出错**」。框架代码很短，让它在每一轮都不出错的工作量很长。
+
+## 4. 一个具体的 trace：让 agent 跑一个真实任务
+
+抽象的 `while llm(history)` 看起来很轻飘，但实际跑一个任务时它具体在干什么？看一个真实例子 — 用户问"今天北京天气怎样，比上海冷还是热？"：
+
+```text title="一个真实 agent trace"
+history = ["用户：今天北京天气怎样，比上海冷还是热？"]
+
+# === Round 1 ===
+step1 = llm(history)
+# → step1.tool_call = get_weather(city="北京")
+result1 = execute(step1)
+# → "北京 12℃，多云"
+history = [..., step1, "工具返回：北京 12℃，多云"]
+
+# === Round 2 ===
+step2 = llm(history)
+# → step2.tool_call = get_weather(city="上海")
+result2 = execute(step2)
+# → "上海 18℃，晴"
+history = [..., step2, "工具返回：上海 18℃，晴"]
+
+# === Round 3 ===
+step3 = llm(history)
+# → step3.is_final_answer = True
+# → step3.answer = "北京今天 12℃ 多云，上海 18℃ 晴。北京比上海冷 6℃。"
+return step3.answer
+```
+
+注意几个细节：
+
+1. **模型自己决定要调用工具两次** — 而不是你预先写死"先调北京再调上海"。如果用户问的是"上海热不热"，它可能只调一次
+2. **工具返回的真实数据被放回 history** — 模型在 Round 2 / Round 3 时能看到 Round 1 的结果，这才有"对比 6℃"这一步推理
+3. **模型自己决定何时停** — Round 3 它判断"两个城市都查到了，可以给最终答案了"，不再调工具
+
+这三个"自己决定" — 决定调几次工具、决定查哪个城市、决定何时停 — 就是 agent 区别于「写死流程」的核心。如果你把这段写成 `step1 = get_weather("北京"); step2 = get_weather("上海"); return f"..."`，那是 workflow，不是 agent。
+
+但什么叫"写死的流程"？同样是「带工具的 LLM」，有的算 workflow、有的算 agent，差别**到底**在哪？这是下一篇 [[workflow-vs-agent]] 要讲的「控制权分水岭」 — 一条非常具体的判定线，给你之后能在任何一段代码上画清楚 workflow 和 agent 的边界。

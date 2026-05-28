@@ -4,12 +4,180 @@ slug: "agent-architecture"
 cluster: "foundations"
 order: 3
 prerequisites: ["workflow-vs-agent"]
-estimatedMinutes: 10
-summary: "三件套 vs Model+Harness 两种架构观"
+estimatedMinutes: 12
+summary: "三件套 vs Model+Harness — 同一个 agent，学界和工业界各有一套常用切法"
 widgets: []
 updated: "2026-05-28"
+references:
+  - id: weng2023agents
+    authors: "Weng, L."
+    year: 2023
+    title: "LLM Powered Autonomous Agents"
+    venue: "lilianweng.github.io"
+    url: "https://lilianweng.github.io/posts/2023-06-23-agent/"
+  - id: anthropic2024agents
+    authors: "Schluntz, E. & Zhang, B. (Anthropic)"
+    year: 2024
+    title: "Building Effective Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/research/building-effective-agents"
+  - id: yang2024swebench
+    authors: "Yang, J., Jimenez, C. E., Wettig, A., Lieret, K., Yao, S., Narasimhan, K., & Press, O."
+    year: 2024
+    title: "SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering"
+    venue: "NeurIPS 2024"
+    url: "https://arxiv.org/abs/2405.15793"
 ---
 
 # Agent 架构双视角
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+前两篇定义了 agent 是什么（[[what-is-agent]]）、怎么和 workflow 区分（[[workflow-vs-agent]]）。但当你打开任何一篇 agent 论文或者工程博客，会立刻发现一个让人困惑的事：**不同作者切 agent 的方式完全不一样**。
+
+- Lilian Weng 2023 的经典博客<Cite id="weng2023agents" />把 agent 切成「Planning + Memory + Tool Use」三件套
+- 2024-2026 业界（OpenAI / Anthropic / Cognition 等）越来越多用「Model + Harness」二分法 — 把 LLM 本身和它外面的脚手架分开
+- Anthropic<Cite id="anthropic2024agents" />把 agent 摆在「workflow patterns + agent loop」的光谱里
+
+哪个切法对？三个都对。它们不是在描述不同的 agent，而是从不同角度切同一个 agent 看截面 — 类似一栋楼的**平面图**和**剖面图**，看的是同一栋楼，关心的细节不同。这一篇把两个最常用的切法（**三件套** vs **Model+Harness**）讲清楚，因为后面读任何论文或工程文章，你都会撞到这两套切法之一，混着读会很乱。
+
+## 1. 切法 A：三件套（学界视角，最被引）
+
+Lilian Weng 2023 那篇 *LLM Powered Autonomous Agents*<Cite id="weng2023agents" /> 几乎是 agent 这个领域被引最多的入门文章。她把 agent 内部能力切成三块：
+
+```text title="三件套架构"
+              ┌──────────────┐
+              │     LLM       │  ← 大脑 / 控制器
+              │  (controller) │
+              └──────┬───────┘
+          ┌──────────┼──────────┐
+     ┌────▼───┐ ┌────▼────┐ ┌───▼─────┐
+     │Planning│ │ Memory  │ │Tool Use │
+     │ 规划    │ │ 记忆     │ │ 工具调用 │
+     └────────┘ └─────────┘ └─────────┘
+```
+
+三件套分别在干什么：
+
+| 件 | 它解决什么 | 后面哪节展开 |
+|------|------|------|
+| **Planning（规划）** | 把大任务拆成子目标（task decomposition），以及失败后反思修正（self-reflection） | [[react-core]] / [[plan-and-solve]] / [[tree-of-thoughts]] / [[reflexion]] |
+| **Memory（记忆）** | 短期记忆 ≈ in-context（塞进 context window 的东西）；长期记忆 ≈ 外部向量库 + 检索 | [[memory-basics]] / [[memgpt]] |
+| **Tool Use（工具调用）** | 调外部 API 补上权重里没有的能力 | [[function-calling]] / [[toolformer]] / [[aci]] |
+
+### 三件套切法的好处
+
+**它告诉你一个 agent 内部该有哪些零件**。如果你要从 0 搭一个 agent，三件套就是组装清单 — 至少要有 LLM 大脑、要会拆解任务（planning）、要能记住历史（memory）、要能调外部能力（tool use）。
+
+这套讲义的整个 [[react-core]] → [[memgpt]] 段落（11 节）基本就是按三件套展开的 — 每一块拆开仔细讲。
+
+### 三件套切法的不好
+
+它**没告诉你这些零件是怎么粘在一起的**。
+
+具体来说：
+- 三件套画在一张图里看着挺清楚，但**实际运行时它们怎么互相调用**？谁先谁后？memory 是被 planning 调，还是反过来？
+- 真实 agent 有大量"非零件"的工程问题 — 怎么控制总循环数？怎么防死循环？怎么管 token budget？怎么处理工具错误？— 这些**全在三件套以外**
+- 三件套是 2023 年的切法，那会儿 agent 主要是 demo。到 2024-2025 真正去做工业级 agent 时，发现"零件清单"只占工作量的 10-20%，剩下 80% 是**让这些零件在一起靠谱地跑**
+
+这就是为什么工业界又发明了第二套切法。
+
+## 2. 切法 B：Agent = Model + Harness（工业界视角）
+
+到了 2024-2026，业界做工业级 agent 时反复观察到一件事：**模型本身**和**模型外面的脚手架**应该分开看 — 因为它们的迭代节奏、瓶颈、责任方完全不同。这套切法在业界（OpenAI、Anthropic 工程博客、Cognition 等）逐渐成为共识：
+
+> **Agent = Model + Harness**
+>
+> - **Model（模型）** — 发动机。GPT / Claude / Gemini 本身，各家在快速收敛、趋同
+> - **Harness（脚手架）** — 模型外的一切：主循环、工具调度、上下文管理、子 agent 编排、反馈回路、约束与校验
+
+"Harness" 字面意思是"挽具" — 给马套上的那一整套缰绳、马鞍、辔头。这个比喻很贴切：模型是马，本身有力气，但要让它**朝你要的方向跑**、**别撞东西**、**多匹马能同时跑**，靠的是外面套的整套挽具。
+
+### 三层嵌套：prompt / context / harness engineering
+
+把 Model+Harness 这条线拉开看，会形成一个三层嵌套关系：
+
+| 层 | 它的核心问题 | 设计对象 |
+|---|---|---|
+| **Prompt engineering** | "该问什么？" | 发给 LLM 的那段指令文本 |
+| **Context engineering** | "该让它看到什么？" | 推理时 LLM 能看到的**全部 token** |
+| **Harness engineering** | "整个环境该怎么设计？" | agent 之外的约束、反馈、运行系统 |
+
+三层嵌套：prompt 在 context 里（prompt 是 context 的一个子集），context 在 harness 里（context 是 harness 临场拼出来的）。三层各自优化的对象不同：
+
+- 优化 **prompt**：改写发给 LLM 的指令措辞
+- 优化 **context**：决定哪些信息进入这一次 LLM 调用（是不是要先检索？要不要带 history？带多少？）
+- 优化 **harness**：决定整个 agent 系统怎么运转（循环多少次？工具怎么调度？多个 agent 怎么协作？）
+
+继续马的比喻：**prompt** 是「向右转」这条命令本身；**context** 是让马看懂往哪走的地图和路标；**harness** 是给马套的挽具加上整条赛道 — 让一匹马能在复杂任务里跑稳，也让多匹马（多个 agent session）能并发跑而不撞车。
+
+### 为什么 2024 之后业界突然单拎 harness
+
+因为反复观察到一个让人困惑的现象：**同一个模型，在项目 A 表现很好，在项目 B 出一堆怪结果。差别不在模型，在它周围的环境**。
+
+一个极端的实证 — SWE-bench 上 SWE-agent 那篇论文<Cite id="yang2024swebench" /> 给出了一个标志性的结果：他们**只改了 agent「编辑代码文件的工具接口」**（让接口对模型更友好 — 比如不让 LLM 直接编辑整个文件，而是给它"编辑某一行"这种更窄的工具），模型一字没动，benchmark 准确率从 **6.7%** 涨到 **68.3%**。
+
+这就是为什么"**瓶颈往往是环境而不是模型**"。模型每代都在变强，但你能不能把它的能力榨出来，取决于你把它放在什么 harness 里跑。这个 6.7% → 68.3% 的对照实验在 [[aci]] 那节会详细拆 — 它是整本讲义里最有冲击力的实证之一。
+
+## 3. 两套切法什么时候用哪个
+
+不是非此即彼。两套切法各有适用场景：
+
+| 你在做的事 | 用哪套切法更顺手 |
+|---|---|
+| 第一次搭 agent，要决定有哪些**零件** | 三件套 — Planning / Memory / Tool Use 给你组装清单 |
+| 读一篇 agent 论文，要定位它**革新的是哪一块** | 三件套 — "ReAct 是改进 Planning 的"、"MemGPT 是改进 Memory 的" |
+| Debug 生产环境 agent 出怪结果 | Model+Harness — 先问"模型本身的 capability 够吗？"再问"harness 给的 context 对吗？" |
+| 评估"该不该升级到更强模型" | Model+Harness — 把 model 和 harness 分开测，看瓶颈到底在哪边 |
+| 架构设计、写工程文档 | Model+Harness — 这套切法把"什么是基础设施、什么是业务逻辑"分得很清 |
+
+### 两套切法的对应关系
+
+虽然侧重不同，两套切法的内容其实是可以互相映射的：
+
+| 三件套（Lilian Weng） | Model + Harness 视角 | 对应章节 |
+|---|---|---|
+| **LLM controller**（大脑） | Model 本身 | 这套讲义不展开 — 是 vLLM / SGLang 推理引擎层的地盘 |
+| **Planning**（规划） | Harness 里**搭好主循环和决策机制**，由模型在循环里**临场决定**每一步 | cluster 2（单 Agent 范式） |
+| **Memory**（记忆） | Harness 里的 context manager（决定每次 LLM 调用看到什么） | cluster 4（上下文工程） |
+| **Tool Use**（工具调用） | Harness 里的工具流水线（定义工具、调度、回填结果） | cluster 3（工具与记忆） |
+
+> [!warning] 一个容易让人糊涂的点：Planning 到底是模型干的还是 harness 干的？
+> 上一篇刚说过「控制流由模型在运行时生成 = agent」。这里又说 Planning 在 Harness 里实现 — 不矛盾吗？
+>
+> 不矛盾。要分清两件事：
+>
+> - **Harness 提供的是循环骨架**：while 循环、终止条件、把 LLM 输出解析成 tool_call、把工具结果塞回 history — 这些是固定代码
+> - **每一轮的具体决策**：调哪个工具、参数是什么、要不要停 — 这些**完全由模型在循环里临场生成**
+>
+> 接前面的马 / 挽具比喻：harness（挽具 + 赛道）决定了**马能往哪些方向走、最高能跑多快、出栏会被拦住**，但**具体往左还是往右、什么时候提速** — 仍然是骑手（model）每一步临场决定的。这就是"控制流由模型生成"和"planning 在 harness 里实现"两件事能共存的原因。
+
+几乎所有的"三件套"组件都是在 harness 里实现的。所以三件套不是和 Model+Harness 对立的 — **它是 Harness 内部的一种分类法**。
+
+> [!example] 一个具体例子：Claude Code 是怎么用这两套切法描述同一件事的
+> Claude Code（Anthropic 自家的 coding agent）：
+>
+> - **三件套视角**：Planning 用 [[react-core]] 范式 + 偶尔升级到 [[plan-and-solve]]；Memory 短期靠 context window、长期靠文件系统 + grep；Tool Use 有 read_file / write_file / bash / web_fetch 等
+> - **Model+Harness 视角**：Model = Claude Opus / Sonnet；Harness = nO 主循环 + 6 步工具流水线 + 子 agent 编排 + Guardian 安全检查
+>
+> 同一个东西，第一个视角告诉你"它有哪些零件"，第二个视角告诉你"零件是怎么粘起来的"。两套都要会，缺哪个都看不全。
+
+## 4. 一个常见的坑：把"框架"当成"架构"
+
+很多人学 agent 时一头扎进 LangChain / LlamaIndex / AutoGen 这些框架，被里面一堆术语（Chain、Agent、Tool、Memory、Callback 等）淹没。这里要把界线画清楚：
+
+> [!warning] 框架 ≠ 架构
+> - **架构**是 agent 本身有哪些组件、怎么互相调用 — 三件套 / Model+Harness 描述的就是架构，跟用什么框架无关
+> - **框架**是某一家公司提供的工程脚手架，用来帮你**实现某种架构** — LangChain 有自己的一套术语，但它实现的还是同一个底层架构
+>
+> 顺序应该是：**先学架构（这套讲义在干的事），再按团队需求挑框架**。反过来先学框架会以为框架的术语就是 agent 的本质，结果换一个框架要重新学一遍。架构是不变的，框架是会过时的。
+
+---
+
+到这里，foundations cluster 三篇结束。回顾你现在掌握的：
+
+| 来自第几篇 | 你能回答 |
+|---|---|
+| [[what-is-agent]] | 什么是 agent？三个洞 + augmented LLM + while 循环 |
+| [[workflow-vs-agent]] | 怎么判断一段代码是 agent 还是 workflow？看控制流 |
+| 这一篇 | agent 内部长什么样？三件套 vs Model+Harness 两套切法 |
+
+下一篇 [[react-core]] 进入 cluster 2「单 Agent 推理范式」 — 把上面表格里 Planning 那一块拆开看。具体的问题是：主循环里那一行 `step = llm(history)`，**模型到底怎么决定下一步该做什么**？最经典、影响最深远的答案是 **ReAct**（Yao et al., ICLR 2023） — 一个朴素到像废话、却显著管用的招。

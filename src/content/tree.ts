@@ -12,8 +12,8 @@ export const treeData: TreeData = {
           "title": "什么是 Agent",
           "order": 1,
           "prerequisites": [],
-          "estimatedMinutes": 8,
-          "summary": "从 stateless function 到 agent 主循环"
+          "estimatedMinutes": 10,
+          "summary": "从 stateless function 到 agent 主循环 — 把'agent 到底是什么'这条线找准"
         },
         {
           "slug": "workflow-vs-agent",
@@ -22,8 +22,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "what-is-agent"
           ],
-          "estimatedMinutes": 10,
-          "summary": "控制权分水岭：代码调度 vs 模型自主决策"
+          "estimatedMinutes": 12,
+          "summary": "控制权分水岭：代码调度 vs 模型自主决策 — 以及五种 workflow 的样子"
         },
         {
           "slug": "agent-architecture",
@@ -32,8 +32,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "workflow-vs-agent"
           ],
-          "estimatedMinutes": 10,
-          "summary": "三件套 vs Model+Harness 两种架构观"
+          "estimatedMinutes": 12,
+          "summary": "三件套 vs Model+Harness — 同一个 agent，学界和工业界各有一套常用切法"
         }
       ]
     },
