@@ -53,7 +53,7 @@ export const LATTE = {
   lavender: '#7287fd',
 } as const
 
-export type Palette = typeof MOCHA
+export type Palette = Record<keyof typeof MOCHA, string>
 
 export const SITE_TITLE = 'AI Agents 学习路线图'
 export const SITE_DESCRIPTION = '交互式 AI Agent 应用层学习平台 — 从 ReAct 到 Harness Engineering'

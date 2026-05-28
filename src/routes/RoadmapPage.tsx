@@ -9,6 +9,7 @@ import {
   getNodesBounds,
   getViewportForBounds,
   type Node,
+  type Edge,
   type ReactFlowInstance,
 } from '@xyflow/react'
 import { SkillNode } from '../components/roadmap/SkillNode'
@@ -52,7 +53,7 @@ export function RoadmapPage() {
   const { mode } = useTheme()
   const p = mode === 'dark' ? MOCHA : LATTE
   const nodeStates = useProgressStore((s) => s.nodes)
-  const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null)
+  const [rfInstance, setRfInstance] = useState<ReactFlowInstance<Node, Edge> | null>(null)
 
   const { nodes: layoutNodes, edges: layoutEdges } = useMemo(
     () => getTreeLayout(treeData.clusters),
@@ -74,7 +75,7 @@ export function RoadmapPage() {
     [layoutNodes]
   )
 
-  const initialEdges = useMemo(
+  const initialEdges: Edge[] = useMemo(
     () =>
       layoutEdges.map((e) => {
         const isCrossCluster = e.style?.opacity === 0.45
