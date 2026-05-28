@@ -1,0 +1,80 @@
+---
+title: "什么是 Agent"
+slug: "what-is-agent"
+cluster: "foundations"
+order: 1
+prerequisites: []
+estimatedMinutes: 8
+summary: "从 stateless function 到 agent 主循环"
+widgets: []
+updated: "2026-05-28"
+---
+
+# 什么是 Agent
+
+> 本节是整门课程的地基。我们从最朴素的 LLM 调用出发，一步步推导出 agent 的核心定义。
+
+## 0.1 从 stateless function 出发
+
+最简单的 LLM 调用长什么样？
+
+```python
+response = llm("法国的首都是哪里?")
+print(response)  # "巴黎"
+```
+
+这是一个 **stateless function**（无状态函数）：输入 → 黑盒 → 输出。没有任何"中间步骤"或"持续对话"的概念。
+
+这个模型有三个洞（三个它做不了的事）：
+1. **训练数据截止**——不知道今天发生了什么
+2. **一次执行、无纠错**——不能自我修正
+3. **不能向外部请求**——不能 Google、不能算、不能查数据库
+
+## 0.2 填第一个洞：外部知识
+
+给模型送进一个问题，然后**把外部结果接入它的生成流**：
+
+```text
+User: 帮我查 Python 3.14 什么时候发布？
+
+# 模型无法回答（训练数据里没有这个信息）
+
+# 给它一个工具！
+Function call: web_search("Python 3.14 release date")
+Result: "Python 3.14 was released on October 7, 2025."
+
+# 把结果放回 prompt
+Assistant: Python 3.14 于 2025 年 10 月 7 日发布。
+```
+
+这就叫 **augmented LLM**（增强版 LLM）：模型 + 工具调用能力。
+
+## 0.3 Agent 主循环
+
+把 augmented LLM 放在一个 **while 循环**里，就是 agent 的最小内核：
+
+```python
+history = [system_prompt, user_task]
+
+while not done:
+    # ① 模型看着历史，决定下一步做什么
+    step = llm(history)
+
+    # ② 如果是 tool_call，执行；如果是最终回答，结束
+    if step.is_tool_call:
+        result = execute_tool(step.tool_name, step.args)
+        history.append(step)
+        history.append({"role": "tool", "content": result})
+    else:
+        return step.content  # 最终回答
+```
+
+这四个关注点——**① 怎么推理下一步、② 怎么用工具、③ 怎么管理越来越长的 history、④ 怎么知道该停了**——就是后面对应 L1 到 L11 的主线。
+
+## 关键定义
+
+> **Agent** = LLM + Tool Use + While Loop + Context Management
+>
+> 中文释义：让模型在一个循环里，看着历史（上下文），自主决定每一步是调用工具还是输出结果。
+
+这个定义里的四个分量，就是整个课程要逐一拆解的对象。

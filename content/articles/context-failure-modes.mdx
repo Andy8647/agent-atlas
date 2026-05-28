@@ -1,0 +1,68 @@
+---
+title: "四种崩法: Context 管不好的后果"
+slug: "context-failure-modes"
+cluster: "context-engineering"
+order: 17
+prerequisites: ["long-running-techniques"]
+estimatedMinutes: 12
+summary: "Poisoning/Distraction/Confusion/Clash — Drew Breunig 的四种失败模式及其实证"
+widgets: ["AttentionCurve"]
+updated: "2026-05-28"
+---
+
+# 四种崩法：Context 管不好的后果
+
+> 接 [[long-running-techniques]]。前文讲了三类管理 context 的技术（compaction、note-taking、sub-agents），本节反其道而行——**当这些技术不够、或用错了的时候，agent 会怎么崩？**
+
+## 前提：更大的窗口放大了问题，而非解决问题
+
+直觉上，"context window 从 4K 涨到 200K"应该能解决大部分 context 问题。事实相反——窗口大了，你能往里塞更多东西，但 attention 机制的根本瓶颈（n² 复杂度、中间信息召回衰减）没有消失。更大的窗口让问题**更难发现、更难 debug**。
+
+操作性问题变成：**"当前上下文里的每一条信息，都在 earn its keep 吗？"**
+
+## Drew Breunig 四模式
+
+Drew Breunig（2025）提出了 agent 上下文失败的四种模式。记住它们——这是 L3 Reflexion、L8 multi-agent debate 和 L9 harness 安全机制的设计动机。
+
+### 1. Poisoning（中毒）— 错误一旦进 context 就洗不掉
+
+> **定义**：一个错误事实或推理步骤进入上下文后，成为后续所有决策的"地基"，compaction/summarization 也救不回来。
+
+这是四种模式里最危险的一种，因为：
+- Compaction 会把错误连同正确信息一起"浓缩"——错误变成了记忆的一部分
+- Sub-agent 隔离是唯一能治 Poisoning 的办法（把错误隔绝在 sub-agent 的 context 内，不让它回到主 agent）
+
+**实证**：Pokemon agent 实验——agent 玩了几千步后，"喝药水恢复 20 HP"这个一次性错误出现在 context 里，之后 agent 反复尝试喝早就没有的药水。
+
+### 2. Distraction（分心）— 模型变成了"历史检索器"而不是"问题解决者"
+
+> **定义**：关键信息被淹没在大量无关历史中，模型在检索式地翻找上下文，而不是推理。
+
+这就是 Lost in the Middle 的工程后果——当关键指令或数据落在 context 中间位置时，召回率最低。
+
+<AttentionCurve />
+
+**实证**：Berkeley Function-Calling Leaderboard — 当 tool definition list 太长时，模型选择正确工具的能力下降。工具数量从 5 个涨到 20 个，准确率明显下降。
+
+### 3. Confusion（混淆）— 相似的描述让模型选错工具
+
+> **定义**：多个工具或角色描述语义重叠或互相矛盾时，上下文变成了噪音。
+
+**实证**：Microsoft / Salesforce 在多分片（shard）知识库上的实验 — 当两个数据源给出不同的问题答案时，agent 倾向于选"听起来更像的"而非"实际正确的"。
+
+### 4. Clash（冲突）— 同一上下文内出现直接矛盾的指令
+
+> **定义**：系统提示、用户指令、搜索结果、工具输出中包含了互相冲突的信息，模型没有可靠的仲裁机制。
+
+## 关键的临床洞察：Compaction 治不了 Poisoning
+
+四种模式和六种治法之间不是一一对应的。最关键的不匹配关系是：
+
+| 失败模式 | 能治的治法 | 无效甚至有害的治法 |
+|----------|-----------|-----------------|
+| Poisoning | Context Quarantine（隔离 bad context） | **Summarization / Compaction**（把错误一起压缩保存） |
+| Distraction | Pruning（删无关信息）、RAG | — |
+| Confusion | Tool Loadout 管理（减少重叠工具） | — |
+| Clash | Context Quarantine | Summarization |
+
+**Compaction 对 Poisoning 是 "disease-cure mismatch"** —— 压缩不仅不治病，还会把毒固定下来。这是 L8 多 agent 辩论中 Anthropic 派主张 sub-agent 隔离的核心论据。

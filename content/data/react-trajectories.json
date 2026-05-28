@@ -1,0 +1,24 @@
+{
+  "apple-remote": {
+    "title": "Apple Remote 问题 — ReAct 正确轨迹",
+    "question": "除了 Apple Remote，还有什么设备能控制 Apple Remote 最初设计要交互的那个程序？",
+    "steps": [
+      { "thought": "Apple Remote 最初是设计来控制 Apple TV 的吗？让我查一下。", "action": "search[Apple Remote]", "observation": "Apple Remote 是 Apple 公司于 2005 年发布的红外遥控器，最初设计用于控制 Front Row 媒体中心程序..." },
+      { "thought": "原来 Apple Remote 是控制 Front Row 的，不是 Apple TV。现在我需要查 Front Row 还能被什么设备控制。", "action": "search[Front Row control]", "observation": "Front Row 可以通过 Apple Remote、键盘快捷键、以及兼容的 IR 遥控器来控制。" },
+      { "thought": "所以除了 Apple Remote，键盘也能控制 Front Row。但"兼容 IR 遥控器"范围太大。让我查查是否有专门的兼容设备。", "action": "search[Front Row compatible devices]", "observation": "Front Row 兼容 Apple Remote 和大多数通用红外遥控器。在 Mac 上，也可以通过键盘的 Command+Esc 快捷键启动和控制。" },
+      { "thought": "现在我可以确定了：除了 Apple Remote，键盘（通过快捷键）也能控制 Front Row。", "action": "finish[键盘（通过 Command+Esc 等快捷键）]", "observation": null }
+    ]
+  },
+  "alfworld": {
+    "title": "ALFWorld 任务 — Act-only 失败 vs ReAct 成功",
+    "steps": [
+      { "thought": "任务是要把 pepper shaker 放进抽屉。我先去抽屉看看。", "action": "Go to drawer 1", "observation": "The drawer 1 is closed." },
+      { "thought": "抽屉是关着的，我得先打开它。", "action": "Open drawer 1", "observation": "抽屉里有一个 dishsponge 和一把勺子。没有 pepper shaker。" },
+      { "thought": "Pepper shaker 不在抽屉里。可能在厨房水槽那边？让我去水槽找。", "action": "Go to sinkbasin 1", "observation": "水槽边有 dishsponge、spatula、soap bottle。没有 pepper shaker。" },
+      { "thought": "水槽也没有。可能在 countertop 上？让我检查一下台面。", "action": "Go to countertop 1", "observation": "台面上有一个 peppershaker、一个 salt shaker 和一个 cutting board。" },
+      { "thought": "找到了！现在拿起 pepper shaker，然后带回抽屉。", "action": "Take peppershaker 1 from countertop 1", "observation": "你拿起了 peppershaker 1。" },
+      { "thought": "现在带着它去抽屉那里。", "action": "Go to drawer 1", "observation": "你回到了 drawer 1 前面。" },
+      { "thought": "打开抽屉，把 pepper shaker 放进去。", "action": "Open drawer 1 then put peppershaker 1 in drawer 1", "observation": "Done. drawer 1 现在包含一个 dishsponge、一把勺子、和一个 peppershaker。" }
+    ]
+  }
+}
