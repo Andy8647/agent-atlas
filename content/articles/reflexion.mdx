@@ -4,12 +4,189 @@ slug: "reflexion"
 cluster: "single-agent-reasoning"
 order: 8
 prerequisites: ["react-failures"]
-estimatedMinutes: 10
-summary: "失败→自然语言反思→episodic memory"
-widgets: []
-updated: "2026-05-28"
+estimatedMinutes: 12
+summary: "用自然语言反思代替梯度 — agent 失败后写一句教训，存进记忆，下次重来"
+widgets: ["ReflexionFlow"]
+updated: "2026-05-29"
+references:
+  - id: shinn2023reflexion
+    authors: "Shinn, N., Cassano, F., Berman, E., Gopinath, A., Narasimhan, K., & Yao, S."
+    year: 2023
+    title: "Reflexion: Language Agents with Verbal Reinforcement Learning"
+    venue: "NeurIPS 2023"
+    url: "https://arxiv.org/abs/2303.11366"
+  - id: shridhar2020alfworld
+    authors: "Shridhar, M., Yuan, X., Côté, M.-A., Bisk, Y., Trischler, A., & Hausknecht, M."
+    year: 2021
+    title: "ALFWorld: Aligning Text and Embodied Environments for Interactive Learning"
+    venue: "ICLR 2021"
+    url: "https://arxiv.org/abs/2010.03768"
+  - id: chen2021humaneval
+    authors: "Chen, M., Tworek, J., Jun, H., Yuan, Q., et al."
+    year: 2021
+    title: "Evaluating Large Language Models Trained on Code"
+    venue: "arXiv:2107.03374"
+    url: "https://arxiv.org/abs/2107.03374"
 ---
 
 # Reflexion: 语言式 RL
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[react-core]] / [[plan-and-solve]] / [[tree-of-thoughts]] 都在改进**单次尝试内部**的推理。它们有一个共同盲区 — **如果整次尝试最终失败了，下一次还是从零开始，没有任何"上次为什么错"的记忆**。
+
+ToT 的回溯只在**一棵树内部**有效；树跑完、任务失败，这次的教训就丢了。[[react-failures]] 那个臭名昭著的"卡在 repetitive loop"的毛病，本质也是 — agent 不记得自己刚才已经在 sinkbasin 1 试过 N 次拿 pepper shaker 都失败了。
+
+Reflexion（Shinn et al., NeurIPS 2023<Cite id="shinn2023reflexion" />，作者依然是 ReAct / ToT 那个 Shunyu Yao 团队）的解法听起来朴素得反直觉：**让 agent 失败后用自然语言写一段反思，存进长期记忆，下次重来时带着这段反思开局**。
+
+这句话翻译成强化学习的术语就是 — **用"语言反思"代替"梯度"** 来推动 agent 改进。这个换字游戏看似简单，但它打开了一个全新的可能性：**agent 可以自我改进，但不动模型权重一个字节**。
+
+## 1. 核心想法：把"梯度"换成"语言"
+
+要看清 Reflexion 在做什么，先用一段话补一下"传统强化学习（RL）"的直觉 — 后面所有的对比都建立在这上面。
+
+**传统 RL 怎么"学"**（用 AlphaGo 当例子）：
+
+1. AlphaGo 下一盘围棋，输/赢（这就是 reward — 一个标量，比如 +1 / -1）
+2. 系统反推：每一步棋对最后输赢的贡献有多大 — 算出一个数字方向（这就是**梯度**）
+3. 按这个数字方向**微调神经网络的权重** — 让那种"赢棋"的下法下次更容易出现
+4. 重复几百万次，模型权重逐步学到"什么棋值得下"
+
+注意整个过程的关键 — **学习的载体是数字（梯度），改的对象是模型权重**。要付出大量样本 + 昂贵的 GPU 训练时间。
+
+Reflexion 做的事是把这套机制**整体搬进语言空间**：
+
+| | 传统 RL（AlphaGo 那种） | Reflexion（verbal RL） |
+|---|---|---|
+| reward 形态 | 一个标量（+1 / -1） | 一段具体的话（"上次我误以为拿到了平底锅"） |
+| "梯度"是什么 | 数字方向（每个权重该往哪改、改多少） | 一段**改进方向的描述**（"下次应该先去别处找"） |
+| 更新的对象 | **模型权重** | **下次开局时带的 context** |
+| 代价 | 几百万样本 + GPU 训练 | 几次失败重试 + 几次额外 LLM 调用 |
+| 可解释性 | 黑箱 | 白箱，反思直接可读 |
+
+论文里管这段自然语言反思叫 **"semantic gradient signal"（语义梯度信号）**：
+
+> This self-reflective feedback acts as a 'semantic' gradient signal by providing the agent with a concrete direction to improve upon.
+>
+> **中文释义**：自我反思的反馈像一个"语义梯度" — 它给 agent 指出一个具体的改进方向，就像梯度给权重指方向一样。
+
+换一种说法：传统 RL 用数字推动权重，Reflexion 用语言推动下一次的行为。权重没动，改的是 context。这呼应了 [[react-core]] 那条核心洞察 — agent 的能力不全在权重里，很多在你喂给它的 context 里。
+
+## 2. 三个角色：Actor / Evaluator / Self-Reflection
+
+Reflexion 不是一个 prompt，是一个**三角色协作**的框架。记住这三个，因为这个"生成者 — 评估者 — 反思者"的结构在后面会反复出现（比如 [[context-engineering]] 里讲的 ACE 框架是 Generator / Reflector / Curator，几乎同构）。
+
+可视化看一下三角色怎么互相喂数据（点 "下一步" 看一次完整的 trial 循环）：
+
+<ReflexionFlow />
+
+逐个说清楚：
+
+### Actor（行动者）
+
+就是 [[react-core]] / [[plan-and-solve]] / [[tree-of-thoughts]] 里讲的 agent 本体（CoT 或 ReAct）。**唯一区别是它现在额外读一块记忆 `mem`**，记忆里是历次失败的反思。Actor 看着"当前观察 + mem 里的历史教训"决定下一步。
+
+### Evaluator（评估者）
+
+给 Actor 的轨迹打一个 reward。reward 从哪来？这是 Reflexion 设计里最关键的部分 — **reward 信号的质量决定了一切**。论文里列了几种来源：
+
+| 任务类型 | reward 信号来源 |
+|---|---|
+| 推理任务（如 HotpotQA） | **Exact Match (EM)** 比对标准答案 |
+| 决策任务（如 ALFWorld） | **写死的启发式**（比如下文 3 的"重复 3 次相同 action 强制失败"） |
+| 代码任务（如 HumanEval<Cite id="chen2021humaneval" />） | **让 agent 自己写单元测试** 来跑 |
+| 通用兜底 | **用一个 LLM 当二分类裁判**（成功 / 失败） |
+
+这正是 [[tree-of-thoughts]] 里 "state evaluator" 那条线的延续 — **reward / 评估信号从哪来，是 agent 能不能自我改进的命门**。[[evaluation]] 那篇会专门展开，这里先记住"Evaluator 的质量是天花板"（第 5 节会血淋淋地证明这点）。
+
+### Self-Reflection（反思者）
+
+把"稀疏的失败信号 + 完整轨迹"消化成**一段具体、可执行的话**。例子（论文 Figure 1 决策任务）：
+
+```text title="Self-Reflection 写出的一条反思"
+"I tried to pick up the pan in stoveburner 1 [...] but the pan was not
+ in stoveburner 1. Next time I should check other locations first."
+
+（我试着从 1 号灶台拿平底锅...但平底锅根本不在 1 号灶台。
+  下次应该先去别的地方找。）
+```
+
+这段话存进 `mem`，下一次 Actor 就带着"别再去 1 号灶台找平底锅"重来。注意反思是**具体的、可执行的、由这条具体轨迹长出来的** — 不是泛泛的 "I should try harder"。
+
+## 3. 双层记忆：短期 + 长期
+
+整个过程是一个 trial（尝试）循环：
+
+```python title="Reflexion 算法骨架"
+mem = []  # 长期记忆：历次失败的反思
+trial = 0
+while not done and trial < max_trials:
+    tau = Actor.run(task, mem)            # 这次的轨迹（短期）
+    reward = Evaluator.score(tau)
+    if reward == success:
+        return tau
+    reflection = SelfReflection.write(task, tau, reward)
+    mem.append(reflection)                # 写进长期记忆
+    if len(mem) > Omega:                  # 反思条数上限（1-3 条）
+        mem = mem[-Omega:]                # 只留最近 Omega 条
+    trial += 1
+```
+
+这里藏着 Reflexion 对**记忆**的关键设计 — **短期 + 长期双层结构**（这是 [[memory-basics]] 那篇的预演）：
+
+- **短期记忆** = 当前这次的轨迹 $\tau$（细粒度、刚刚发生的步骤）
+- **长期记忆** = 历次的自我反思 $mem$（跨尝试的、被蒸馏过的教训）
+
+因为 context 装不下无限反思，$mem$ 被**限制在 1-3 条**（论文记作 $\Omega$）。**记忆有上限、得挑着留** — 这件事正是 [[memgpt]] 和 [[context-engineering]] 的核心议题：**记忆不是越多越好，而是"留对的那几条"**。
+
+## 4. 它怎么精准杀死 repetitive loop
+
+[[react-failures]] 那个 ReAct 在 ALFWorld<Cite id="shridhar2020alfworld" /> 死循环的经典 trace — agent 在 sinkbasin 1 找不到 pepper shaker，却**一遍遍重复 "take peppershaker from sinkbasin 1"** — Reflexion 怎么治？
+
+Reflexion 用两个动作精准对接：
+
+### 动作 1：写死断路器规则（在 Evaluator 里）
+
+> If the agent executes the same action and receives the same response for more than **3 cycles**, or if the number of actions exceeds **30** (inefficient planning), we self-reflect.
+>
+> **中文释义**：如果 agent 重复同一个 action 拿到同一个 response **超过 3 次**，或者总 action 数超过 **30**（规划低效），就强制停下来反思。
+
+这相当于给"重复循环"装了个断路器 — agent 自己跳不出去没关系，**Evaluator 替它判定"你陷死循环了，停"**。
+
+### 动作 2：把失败蒸馏成 self-hint
+
+断路器触发后，Self-Reflection 把"那条又长又错的失败轨迹"压缩成一句"别再这么干"，存进长期记忆。下一次 Actor 看着这句话开局，自然就不会再重复同样的错。
+
+**效果**：ReAct + Reflexion 在 134 个 ALFWorld 任务里完成了 **130 个**，而纯 ReAct 在第 6-7 次尝试就**停止进步**了（它没有记忆，每次重试都重蹈覆辙）。论文 Figure 3 画得很清楚：纯 ReAct 的幻觉率收敛在 22% 下不去，Reflexion 几乎清零。
+
+## 5. 数字和它的天花板
+
+**成功的数字**：
+
+- **ALFWorld**（决策）：+22% 绝对成功率（12 次尝试内）
+- **HotpotQA**（推理）：+20%；即使不给标准答案上下文，靠自我纠错也能提升 14%
+- **HumanEval**（Python 代码）：**pass@1 91%**，超过当时 GPT-4 的 80%，创了 SOTA
+
+但这里有一个比成功更重要的**诚实结论** — **Reflexion 的能力被它的"自我评估能力"卡死**：
+
+> [!warning] 自我评估的质量是天花板 — 全套讲义反复出现的主题
+> 代码任务里，Reflexion 靠**自己写的单元测试**来判断对错。问题来了：
+>
+> - 如果模型写出的测试是**假阳性**（false positive） — 测试通过了但解其实是错的 — agent 会**过早地宣布成功**，反思机制根本不会启动
+> - **MBPP Python** 上，这个假阳性率高达 **16.3%**（HumanEval Python 只有 1.4%），直接导致 Reflexion 在 MBPP Python 上**反而不如**基线 GPT-4
+>
+> 一句话：**agent 只能反思它"知道自己错了"的失败。如果 Evaluator 看不出失败，反思就无从谈起**。
+>
+> 这就是为什么 [[evaluation]] 那一节不是可选项 — **评估信号的质量，是一切自我改进方法的上限**。
+
+**Ablation 的洞见**：论文还拆开验证了"反思"到底有没有用 —
+
+- 只给 episodic memory（把上次轨迹塞回去），不写语言反思：有用，但不如完整 Reflexion
+- 完整 Reflexion（带语言反思）比"只有记忆"再高 **8%**
+- 结论：**"refinement-only（只重试）" 不如 "self-reflection-guided refinement（带反思地重试）"**
+
+光把失败轨迹塞回 context 不够。要有那句"我哪里错了、下次怎么改"，反思才真正管用。
+
+---
+
+cluster 2 到这里讲完。一句话收束 — **所有的单 agent 推理范式（线性 → 树 → 跨尝试反思）都受限于一件事：agent 自己评估自己是否做对的能力**。ToT 的 state evaluator、Reflexion 的 Evaluator、未来 [[evaluation]] 那篇要讲的 LLM-as-judge — 都是同一件事的不同名字。**评估信号的质量决定一切自我改进方法的上限**。
+
+接下来 cluster 3 转向三件套（[[agent-architecture]]）的另一条腿 — **Tool Use**。[[react-failures]] 里那个 23% 的 search result error 已经预告了核心命题：工具本身的质量是 agent 的硬天花板。下一篇 [[function-calling]] 从工具调用机制讲起，最后会落到一个让人震惊的实证 — 只改了 SWE-bench agent 的"编辑文件工具接口"，模型一字没动，准确率从 6.7% 干到 68.3%。

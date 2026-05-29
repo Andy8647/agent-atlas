@@ -4,12 +4,198 @@ slug: "react-failures"
 cluster: "single-agent-reasoning"
 order: 5
 prerequisites: ["react-core"]
-estimatedMinutes: 10
-summary: "幻觉率 0% vs CoT 56%"
+estimatedMinutes: 12
+summary: "0% 幻觉的另一面 — Reasoning error 47% / Repetitive loop / 工具拉胯导致的 derail"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: yao2023react
+    authors: "Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y."
+    year: 2023
+    title: "ReAct: Synergizing Reasoning and Acting in Language Models"
+    venue: "ICLR 2023"
+    url: "https://arxiv.org/abs/2210.03629"
+  - id: shridhar2020alfworld
+    authors: "Shridhar, M., Yuan, X., Côté, M.-A., Bisk, Y., Trischler, A., & Hausknecht, M."
+    year: 2021
+    title: "ALFWorld: Aligning Text and Embodied Environments for Interactive Learning"
+    venue: "ICLR 2021"
+    url: "https://arxiv.org/abs/2010.03768"
 ---
 
 # ReAct 的失败模式
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[react-core]] 那篇文章里，Table 2 给出了 ReAct vs CoT 的失败模式对照表，并提了三条结论：**ReAct 几乎不幻觉**、**但 reasoning error 反而更高**、**有一个 ReAct 特有的失败叫 repetitive loop**。这一篇把这三条逐一拆开看 — 不是为了让你记住更多数字，而是因为 **ReAct 的失败正是后面三节文章（[[plan-and-solve]] / [[tree-of-thoughts]] / [[reflexion]]）的设计动机**。
+
+更重要的是：这三种失败在你自己实际跑 agent 时一定会撞到。能给一个 derail 的 trace 命名（"这是 reasoning error / 这是 repetitive loop / 这是 search result error"），是从「凭感觉调 prompt」到「按病因开药」的第一步。
+
+## 1. 先把 Table 2 完整看一遍
+
+ReAct 论文<Cite id="yao2023react" />作者人工标注了 200 条 HotpotQA 轨迹（ReAct 和 CoT 各 100，对错各半），分类成功 / 失败原因。完整数据（数字是该类样本占比）：
+
+| 模式 | 类型 | ReAct | CoT |
+|---|---|---|---|
+| ✓ True positive | 推理和事实都对 | 94% | 86% |
+| ⚠ False positive | 幻觉但蒙对了 | 6% | 14% |
+| ✗ **Reasoning error** | 推理本身错（含 repetitive loop） | **47%** | **16%** |
+| ✗ Search result error | 搜不到有用信息 | 23% | — |
+| ✗ **Hallucination** | 凭空捏造事实 | **0%** | **56%** |
+| ✗ Label ambiguity | 答对了但标准答案没对上 | 29% | 28% |
+
+注意几个特别处：
+
+- 第 5 行 hallucination 列，**ReAct 是 0%**。一字未改，也不是"接近 0"，是真的零 — 100 条标注里没有一条是凭空捏造事实。这是整篇论文里最戏剧化的数字
+- 但代价在第 3 行 — ReAct 的 reasoning error 比 CoT 高了 3 倍（47% vs 16%）
+- 第 4 行 search result error 23% 是 ReAct 独有的 — CoT 不接触工具，自然不会"搜不到"，但也因此会幻觉
+
+这三行加起来定义了 ReAct 的失败画像。下面挨个拆。
+
+## 2. 失败 #1：Reasoning Error 47% — 结构约束的代价
+
+这一条是整张表里最反直觉的。直觉上你会觉得"既然 ReAct 让模型一边想一边做，应该比 CoT 想得更清楚才对" — 怎么反而推理错得更多？
+
+论文给的解释一句话讲完：
+
+> While interleaving reasoning, action and observation steps improves ReAct's groundedness and trustworthiness, such a **structural constraint** also reduces its **flexibility in formulating reasoning steps**.
+>
+> **中文释义**：交替"想 - 做 - 看"这个结构约束虽然让 ReAct 更可靠，但**也限制了它组织推理步骤的灵活性** — 它被迫一步一动，没法像 CoT 那样自由地长篇推演。
+
+具体是怎么"被迫"的？看一个对比。同一道 HotpotQA 题，两种范式的推理"形状"完全不同：
+
+```text title="CoT vs ReAct · 推理形状对比"
+─── CoT（自由推理） ─────────────────────────────────
+Thought: 让我把这道题完全想清楚 — 题目问的是 A 控制 B 控制 C，
+         那 A 是什么、B 是什么、A 还有没有别的控制方式...
+         可能性 1: ... 可能性 2: ... 综合来看应该是 ...
+Answer: X
+（一段连贯的、可以来回考量多种可能的长推理）
+
+─── ReAct（被结构约束） ─────────────────────────────
+Thought 1: 我得先搜 A
+Action 1: search[A]                  ← 必须立刻产出一个 action
+Obs 1: A 是 ...
+Thought 2: 那 A 关联的是 B 还是 C？  ← 但下一句又得立刻动手
+Action 2: search[B]                  
+Obs 2: ...
+（每一步 Thought 长度有限、必须紧接一个 Action，推理被切碎）
+```
+
+ReAct 用"可靠"换"灵活"。CoT 可以在脑子里把一整道题翻来覆去想透，ReAct 必须把推理切成"想一句就动一下"的小段。当任务需要**整体把握、回溯比较、考虑多条路径**时，ReAct 的小段推理就接不上劲。
+
+> [!important] 这条失败直接定义了后两节文章
+> 解决"结构约束 → 推理灵活性低"有两个完全不同的方向：
+>
+> - **[[plan-and-solve]]**：在 ReAct 开始一步步动之前，**先让模型完整地想一遍整道题**，产出一个完整 plan，再按 plan 去 ReAct 执行。等于在 ReAct 外面套一层 CoT
+> - **[[tree-of-thoughts]]**：直接把"一条线性推理"改成"一棵可探索、可回溯的搜索树"。让模型在每一步生成多个候选 thought，自己评估、选最优、走不通了能退回去
+>
+> 两条路径成本差一个数量级，应用场景不同，但都是在治 ReAct 这个 47% 的 reasoning error
+
+## 3. 失败 #2：Repetitive Loop — ReAct 特有的死法
+
+Reasoning error 47% 里，有一类特别值得拎出来 — 模型**反复生成上一次完全一样的 thought 和 action**，跳不出循环。论文的诊断：
+
+> A common error in baseline failed AlfWorld<Cite id="shridhar2020alfworld" /> trajectories is when an agent thinks it has possession of an item but **does not actually have the item**. The agent proceeds to execute several actions [...] and is **not able to backtrack** its actions to find the mistake.
+>
+> **中文释义**：基线最常见的失败是 — agent **以为**自己拿到了某个物品（其实没有），然后基于这个错误一路执行下去，且**没法回溯**去找错在哪。
+
+回看 [[react-core]] 里 Act-only 那个 ALFWorld 例子：
+
+```text title="ALFWorld · Repetitive loop"
+任务：把 pepper shaker 放进抽屉
+
+Thought 1: 我得去水槽找 pepper shaker
+Act 1: Go to sinkbasin 1
+Obs 1: 水槽边有 dishsponge、spatula（没有 pepper shaker）
+
+Thought 2: 我已经在水槽边了，拿起 pepper shaker
+Act 2: Take peppershaker from sinkbasin 1
+Obs 2: Nothing happens.
+
+Thought 3: 我以为我已经拿到了，再试一次
+Act 3: Take peppershaker from sinkbasin 1
+Obs 3: Nothing happens.   ← 一模一样的失败
+
+Thought 4: 还是没拿到，再试一次
+Act 4: Take peppershaker from sinkbasin 1
+Obs 4: Nothing happens.   ← agent 卡死在这条死路上
+... （重复 N 次直到达到 max_steps）
+```
+
+关键在 Thought 3 和 Thought 4 — 模型**看着自己刚才已经失败过、Obs 也明确说了"Nothing happens"**，但下一轮的 thought 依然假定"试一下就行"。为什么会这样？
+
+因为 ReAct 的循环里**没有任何机制让它"回头审视失败模式"**。模型每一轮只看 `llm(history)`，history 里确实有失败记录，但**模型默认下一步的策略就是"继续往前推"** — 它没有"我已经试过 N 次都不行，需要换策略"这个判断。
+
+> [!warning] Repetitive loop 是 ReAct 设计的"盲区"，不是模型笨
+> 即使把模型换成 GPT-4 / Claude Opus，同样的 trace 还是会发生。问题不在模型能力，在 **ReAct 这个范式本身没有「跨步反思」机制**。
+>
+> 解决这个特定失败有专门的一节：
+>
+> - **[[reflexion]]**：失败后让 agent 用自然语言写一段反思（"上次我反复试 sinkbasin 1 都不行，下次应该换地方找"），存进长期记忆。下一次重试时带着这条反思开局。
+>
+> Reflexion 在 ALFWorld 上把成功率从 ReAct 的某个低水平直接拉到 **130/134**，专治 repetitive loop。
+
+## 4. 失败 #3：Search Result Error 23% — 不是 ReAct 的锅
+
+第三个 ReAct 特有的失败模式占了 23%，但它**不是范式本身的问题，而是工具的问题**。
+
+回看 [[react-core]] 那条 Apple Remote 正确轨迹的中间一步：
+
+```text
+Thought 2: ...我得搜 Front Row,看还有什么设备能控制它
+Act 2: search[Front Row]
+Obs 2: 没找到 "Front Row"。相似结果: ['Front Row Seat to Earth', 'Front Row (software)'...]
+```
+
+这里 ReAct 表现得很好 — Thought 3 自己重新组织了 query 改成 `search[Front Row (software)]`，最终答对。
+
+但**如果工具更糟糕**呢 — 如果 Wikipedia API 不返回相似结果，只甩一个 `"Not found"`？或者 search 接口对查询语法有奇怪要求，模型不知道？或者结果格式难解析？这时不管 ReAct 的推理多好，它就**根本拿不到那个对的信息**。
+
+论文的 23% search result error 里有一大部分是这种 — agent 推理没错、循环没死，但**信息源给的东西就是不对**，整个轨迹 derail。
+
+> [!important] 这个失败定义了 cluster 3 的核心命题
+> "ReAct 的天花板被工具的质量卡死" — 这个观察会被后面几节文章反复证实，并发展成一个完整的工程学科：
+>
+> - **[[function-calling]]**：现代工具调用机制（输入 schema / 错误处理 / 多步组合）
+> - **[[aci]]**：Agent-Computer Interface — 把"该怎么给 agent 设计工具"做成一门学问。一个标志性实证：只改了 SWE-agent 编辑文件的工具接口、模型没动，benchmark 准确率 **6.7% → 68.3%**
+>
+> 你可以把这个 23% 看作整个 cluster 3 存在的理由 — 我们花 5 节文章讲"工具与记忆"，本质上是在把 ReAct 的天花板抬起来
+
+## 5. 一个综合诊断练习
+
+把这三种失败模式练熟。下面这条 trace 里 agent 卡住了，是哪种失败？
+
+```text
+任务: 找出 2026 年获得图灵奖的人
+
+Thought 1: 我得搜图灵奖最新得主
+Act 1: search[Turing Award 2026]
+Obs 1: No results found for "Turing Award 2026".
+
+Thought 2: 那我搜近年图灵奖得主
+Act 2: search[recent Turing Award winners]
+Obs 2: No results found for "recent Turing Award winners".
+
+Thought 3: 试试用中文
+Act 3: search[2026 图灵奖]
+Obs 3: No results found for "2026 图灵奖".
+
+Thought 4: 那我换关键词
+Act 4: search[Turing Award winner]
+Obs 4: No results found for "Turing Award winner".
+
+[max_steps reached, agent gave up]
+```
+
+> [!example] 答案
+> 这是 **search result error**（失败 #3），**不是** repetitive loop。
+>
+> 关键区别：
+>
+> - Repetitive loop：模型反复输出**完全一样**的 action（Take peppershaker, Take peppershaker, Take peppershaker...）— 是 agent 没有跨步学习能力
+> - Search result error：模型**有在合理地改 query**（不同关键词、不同语言、不同表述）— 是工具本身没有 indexing 到目标信息
+>
+> 治法也不同：search result error 治不了 reflexion 反思（"反思一下我哪里没搜对" — 它已经在反思了），要治的是**工具底层的检索质量**。换更新的 API、加 fallback 数据源、或者引入新的工具（如 web browser 而不是封闭搜索）。
+
+---
+
+接下来的 4 篇文章正好对应 ReAct 的 3 种失败 — [[plan-and-solve]] 和 [[tree-of-thoughts]] 治 reasoning error 的不同侧面，[[reflexion]] 治 repetitive loop，而 cluster 3 的 [[function-calling]] / [[aci]] 治 search result error。下一篇 [[plan-and-solve]] 先从最轻量的解法开始 — 用一句 prompt 让模型在动手之前先把整道题想清楚。

@@ -4,65 +4,223 @@ slug: "context-failure-modes"
 cluster: "context-engineering"
 order: 17
 prerequisites: ["long-running-techniques"]
-estimatedMinutes: 12
-summary: "Poisoning/Distraction/Confusion/Clash — Drew Breunig 的四种失败模式及其实证"
+estimatedMinutes: 13
+summary: "Poisoning / Distraction / Confusion / Clash — Drew Breunig 的四种失败模式 + 学术祖宗"
 widgets: ["AttentionCurve"]
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: breunig2025fail
+    authors: "Breunig, D."
+    year: 2025
+    title: "How Long Contexts Fail"
+    venue: "dbreunig.com"
+    url: "https://www.dbreunig.com/2025/06/22/how-contexts-fail-and-how-to-fix-them.html"
+  - id: liu2024lostmiddle
+    authors: "Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., & Liang, P."
+    year: 2024
+    title: "Lost in the Middle: How Language Models Use Long Contexts"
+    venue: "TACL 2024"
+    url: "https://arxiv.org/abs/2307.03172"
+  - id: xiao2024streamingllm
+    authors: "Xiao, G., Tian, Y., Chen, B., Han, S., & Lewis, M."
+    year: 2024
+    title: "Efficient Streaming Language Models with Attention Sinks"
+    venue: "ICLR 2024"
+    url: "https://arxiv.org/abs/2309.17453"
+  - id: zhang2024snowballing
+    authors: "Zhang, M., Press, O., Merrill, W., Liu, A., & Smith, N. A."
+    year: 2024
+    title: "How Language Model Hallucinations Can Snowball"
+    venue: "ICML 2024"
+    url: "https://arxiv.org/abs/2305.13534"
+  - id: chroma2024rot
+    authors: "Chroma Research"
+    year: 2024
+    title: "Context Rot: How Increasing Input Tokens Impacts LLM Performance"
+    venue: "Chroma Technical Report"
+    url: "https://research.trychroma.com/context-rot"
 ---
 
 # 四种崩法：Context 管不好的后果
 
-> 接 [[long-running-techniques]]。前文讲了三类管理 context 的技术（compaction、note-taking、sub-agents），本节反其道而行——**当这些技术不够、或用错了的时候，agent 会怎么崩？**
+[[long-running-techniques]] 那篇讲的是**正面纪律** — context 里该放什么、不该放什么。它预设了一个事实：context 塞错、塞多会出事（"context rot"）。这一篇把这个笼统的"会出事"**解剖**成四种界限分明的崩法，给每一种配实证，再追到学术祖宗。
 
-## 前提：更大的窗口放大了问题，而非解决问题
+学完这一篇，你 debug 一个抽风的 agent 时能精确说出 — "它现在是中毒了、分心了、混淆了还是自相冲突了" — 而不是含糊地甩一句"context 太长"。能精确命名故障，才能配对正确的修复方法 — 因为四种崩法的治法完全不一样，搞错了不仅修不好，可能还把毒腌得更深（见 §3）。
 
-直觉上，"context window 从 4K 涨到 200K"应该能解决大部分 context 问题。事实相反——窗口大了，你能往里塞更多东西，但 attention 机制的根本瓶颈（n² 复杂度、中间信息召回衰减）没有消失。更大的窗口让问题**更难发现、更难 debug**。
+> [!note] 一句方法论提醒
+> Drew Breunig<Cite id="breunig2025fail" /> 的四模式来自实践者博客（不是同行评审论文），适合当**思维框架**用 — 但它引用的下游论文（Microsoft / Salesforce、Berkeley、Chroma）才是真正的实证。下面我把"框架"和"证据"分开摆，你自己掂量可信度。这本身就是读 agent 圈材料该有的姿势：大量结论来自博客和工程报告，不是 peer-reviewed paper。
 
-操作性问题变成：**"当前上下文里的每一条信息，都在 earn its keep 吗？"**
+## 1. 前提：窗口越大，问题越被放大
 
-## Drew Breunig 四模式
+一句话立住整节：**context 里的每一个 token 都在影响输出**。所以 —
 
-Drew Breunig（2025）提出了 agent 上下文失败的四种模式。记住它们——这是 L3 Reflexion、L8 multi-agent debate 和 L9 harness 安全机制的设计动机。
+> 更大的窗口（Llama 4 Scout 的 10M、Gemini 的 1M+）**不消除**这个问题，**而是放大它**。
 
-### 1. Poisoning（中毒）— 错误一旦进 context 就洗不掉
+为什么？因为窗口大了，你就更容易"什么都往里塞"。每一份塞进去的垃圾都在**稀释注意力预算**（[[context-engineering]] 里的核心概念），都在制造下面四种崩法之一。
 
-> **定义**：一个错误事实或推理步骤进入上下文后，成为后续所有决策的"地基"，compaction/summarization 也救不回来。
+Drew Breunig 给的运营级提问很犀利：
 
-这是四种模式里最危险的一种，因为：
-- Compaction 会把错误连同正确信息一起"浓缩"——错误变成了记忆的一部分
-- Sub-agent 隔离是唯一能治 Poisoning 的办法（把错误隔绝在 sub-agent 的 context 内，不让它回到主 agent）
+> Is everything in this context **earning its keep**?
+>
+> 这个 context 里的每样东西，**都在挣它占的那份位置吗**？
 
-**实证**：Pokemon agent 实验——agent 玩了几千步后，"喝药水恢复 20 HP"这个一次性错误出现在 context 里，之后 agent 反复尝试喝早就没有的药水。
+这就是 [[context-engineering]] 里"最小高信号集合"原则的可操作版。如果不能干净地回答"是" — **删掉**。
 
-### 2. Distraction（分心）— 模型变成了"历史检索器"而不是"问题解决者"
+## 2. 四种崩法 — 失败分类学
 
-> **定义**：关键信息被淹没在大量无关历史中，模型在检索式地翻找上下文，而不是推理。
+| 崩法 | 一句定义 | 它其实是前面哪节的回旋镖 |
+|---|---|---|
+| **① Poisoning（中毒）** | 错误一旦进 context，被反复当真理引用 | [[react-failures]] 的幻觉留在 context 里赶不走 |
+| **② Distraction（分心）** | context 长到模型只会"翻历史"而不再综合 | [[memory-basics]] "窗口大≠用得好"的具体后果 |
+| **③ Confusion（混淆）** | 多余的工具或文档把模型推向低质回答 | [[aci]] 工具最小化原则不做就会得这病 |
+| **④ Clash（冲突）** | 新进来的信息和 context 里旧的矛盾 | 多源信息拼装时的硬伤 |
 
-这就是 Lost in the Middle 的工程后果——当关键指令或数据落在 context 中间位置时，召回率最低。
+挨个补一个让你记得住的实证 + 关键细节。
+
+### ① Poisoning（中毒）— 错误一旦进 context 就洗不掉
+
+> **定义**：一个错误事实或推理步骤进入 context 后，成为后续所有决策的"地基"，**summarization 也救不回来**（见 §3）。
+
+最有名的实证 — **Gemini 2.5 玩 Pokémon** 时，把一个**幻觉出来的目标**写进了自己的"目标区"（"goal box"），然后**死磕这个根本不可能完成的目标**几千步。一旦中毒，模型把错误当 ground truth，后面全盘崩。
+
+为什么 Poisoning 是四种崩法里最危险的一种？
+
+- **Compaction 会把错误连同正确信息一起"浓缩"** — 错误变成了记忆的一部分（这是 §3 的核心）
+- **Sub-agent 隔离是唯一可靠的解药** — 把错误隔绝在 sub-agent 的 context 内，不让它回到主 agent。详见 [[long-running-techniques]] 和 [[context-fixes-evidence]]
+
+### ② Distraction（分心）— 模型变成"历史检索器"而不是"问题解决者"
+
+> **定义**：关键信息被淹没在大量无关历史中，模型在**检索式地翻找上下文**，而不是综合推理。
+
+同一个 Pokémon agent，超过 ~100k token 后，**倾向于重复历史里的动作而不是综合出新方案** — 它"忘了"自己本来有推理能力，退化成一个历史检索器。
+
+这正是 **Lost in the Middle**<Cite id="liu2024lostmiddle" /> 的工程后果 — 当关键指令或数据落在 context 中间位置时，召回率最低，呈一条 **U 形曲线**（首尾召回高、中间塌陷）：
 
 <AttentionCurve />
 
-**实证**：Berkeley Function-Calling Leaderboard — 当 tool definition list 太长时，模型选择正确工具的能力下降。工具数量从 5 个涨到 20 个，准确率明显下降。
+**实证**：Berkeley Function-Calling Leaderboard — 当 tool definition list 太长时，模型选择正确工具的能力下降。工具从 5 个涨到 20 个，准确率明显下降；DeepSeek-v3 超过 30 个工具就开始混淆，超过 100 几乎必败。这个数字直接戳出 [[aci]] 那节的核心命题。
 
-### 3. Confusion（混淆）— 相似的描述让模型选错工具
+### ③ Confusion（混淆）— 相似的描述让模型选错
 
-> **定义**：多个工具或角色描述语义重叠或互相矛盾时，上下文变成了噪音。
+> **定义**：多个工具或角色描述语义重叠或互相矛盾时，context 变成噪音。
 
-**实证**：Microsoft / Salesforce 在多分片（shard）知识库上的实验 — 当两个数据源给出不同的问题答案时，agent 倾向于选"听起来更像的"而非"实际正确的"。
+Berkeley Function-Calling Leaderboard 的硬结论：
 
-### 4. Clash（冲突）— 同一上下文内出现直接矛盾的指令
+> Giving the model more than one tool **degrades performance on every model**.
+>
+> **给模型多于一个工具，每个模型的表现都会变差**。
 
-> **定义**：系统提示、用户指令、搜索结果、工具输出中包含了互相冲突的信息，模型没有可靠的仲裁机制。
+哪怕那些工具这次用不上 — 光是"摆在那"也拉低质量。这是 [[aci]] 里"工具最小不重叠"原则的实证根。
 
-## 关键的临床洞察：Compaction 治不了 Poisoning
+**Microsoft / Salesforce** 在多分片（sharded）知识库上的实验更刺眼 — 当两个数据源给出不同答案时，agent **倾向于选"听起来更像的"而非"实际正确的"**。
 
-四种模式和六种治法之间不是一一对应的。最关键的不匹配关系是：
+### ④ Clash（冲突）— 同一 context 内出现直接矛盾的指令
+
+> **定义**：系统提示、用户指令、搜索结果、工具输出中包含互相冲突的信息，模型没有可靠的仲裁机制。
+
+**Microsoft / Salesforce** 把 prompt 信息**打散（sharded）到多轮**里 vs 集中给：
+
+- **平均掉 39%**
+- **o3**：98.1 → 64.1
+
+信息散落 + 互相矛盾，模型就垮。这是为什么 [[context-design]] 强调 "instruction 集中放" 而不要分散在 history 里。
+
+## 3. 最重要的反转：Compaction 治不了中毒，只会把它腌进去
+
+先一句话定义术语：**compaction（压缩摘要）** 是长程 agent 的常见手法 — 当 history 累积到接近 context window 上限时，让一个 LLM 把"前 N 步发生了什么"摘要成几段精简文字，替换掉原来的 history，给后续步骤腾出空间。[[long-running-techniques]] 那篇详讲，这里你只需要记住它的本质是 **"忠实压缩，不丢主要信息"**。
+
+这个手法对大多数 context 问题都有效 — 但它对 **Poisoning（中毒）** 帮倒忙：
+
+> [!warning] Compaction 不是万能的
+> 面对 Poisoning（中毒），compaction 不仅没用，还有害：
+>
+> > Compaction / summarization **preserves the error rather than fixing it**.
+> >
+> > 压缩摘要会**把错误一起腌进新摘要**，而不是修掉它。
+>
+> 因为摘要的本质是"忠实地浓缩 context"，而被中毒的 context 里那个错误结论会被**忠实地浓缩进去**、继续当真理引用。**中毒的唯一可靠解药，是开一个全新的 context（fresh session），把毒源彻底丢掉**。
+
+记住这张"病 — 药匹配表"里最反直觉的一格：
 
 | 失败模式 | 能治的治法 | 无效甚至有害的治法 |
-|----------|-----------|-----------------|
-| Poisoning | Context Quarantine（隔离 bad context） | **Summarization / Compaction**（把错误一起压缩保存） |
-| Distraction | Pruning（删无关信息）、RAG | — |
-| Confusion | Tool Loadout 管理（减少重叠工具） | — |
-| Clash | Context Quarantine | Summarization |
+|---|---|---|
+| Poisoning（中毒） | Context Quarantine（隔离 bad context） | **Summarization / Compaction**（把错误一起压缩保存） |
+| Distraction（分心） | Pruning（删无关信息）/ RAG | — |
+| Confusion（混淆） | Tool Loadout 管理（减少重叠工具） | — |
+| Clash（冲突） | Context Quarantine | Summarization |
 
-**Compaction 对 Poisoning 是 "disease-cure mismatch"** —— 压缩不仅不治病，还会把毒固定下来。这是 L8 多 agent 辩论中 Anthropic 派主张 sub-agent 隔离的核心论据。
+Compaction 对 Poisoning 是 "disease-cure mismatch" — 压缩不仅不治病，还把毒固定下来。这一条会成为 [[multi-agent-debate]] 里 Anthropic 派主张 sub-agent 隔离的核心论据。
+
+它也回扣 [[reflexion]]：如果反思基于一个中毒的轨迹，反思本身就可能是错的 — agent 自我改进的硬上限之一就是 context 不能被毒。
+
+## 4. 学术祖宗：三个 paper 把四模式落到根
+
+四模式是框架，下面是它们的学术祖宗和大规模实证。这才是你该真正信的部分。
+
+### Lost in the Middle (Liu et al., TACL 2024)
+
+把关键信息放在长 context 的**中间**，召回最差；放开头或结尾最好 — 召回曲线呈 **U 形**<Cite id="liu2024lostmiddle" />。这是 [[memory-basics]] / [[context-engineering]] 反复引用的那条 "中间信息会丢"，也是 Distraction 的实证根。
+
+实际意义：组织 context 时，**最重要的信息放开头或结尾**，中间放可有可无的细节。不要把最关键的指令塞在中间，否则模型会"跳过"它。
+
+### Attention Sink / StreamingLLM (Xiao et al., ICLR 2024)
+
+序列**最前面的 token 是"注意力沉降点"（attention sink）**，模型会把大量注意力锚在那里<Cite id="xiao2024streamingllm" />；**删掉开头几个 token，模型会崩**。这解释了 Chroma 实验里"唯一 token 出现在开头时位置准确率最高"的发现。
+
+实际意义：**system prompt 放最前面是有 attention 机制上的合理性的** — 不只是约定俗成。
+
+### Hallucination Snowballing (Zhang et al., ICML 2024)
+
+模型一旦说错一句，会为了"自圆其说"接着错下去 — **一错连环错**<Cite id="zhang2024snowballing" />。这是 **Poisoning 的单轮祖宗** —
+
+| | Snowballing | Poisoning |
+|---|---|---|
+| 时间尺度 | 一次生成内 | 跨多轮、错误留在 context 里反复滚 |
+| 来源 | 自回归解码机制 | context 管理失败 |
+| 关系 | Poisoning 的微观源头 | Snowballing 的宏观后果 |
+
+## 5. 大规模实证：Chroma "Context Rot"
+
+Chroma Research<Cite id="chroma2024rot" />测了 18 个前沿模型，给出了一份目前最完整的"长 context 衰减"实证：
+
+**核心结论**：LLM **不均匀**地处理 context；输入越长，性能以"出人意料且不均匀"的方式下降 — **哪怕是短 context 下能轻松做对的任务**。
+
+**反直觉发现 1**：**打乱（shuffled）的 haystack，表现反而好过逻辑结构化的 haystack**。这意味着"按章节组织"有时反而损害长 context 能力 — 因为模型可能基于"结构线索"做出错误的检索决策。
+
+**反直觉发现 2**：对话任务里，**只给聚焦的相关输入（focused-only）远胜于给全量（full input）**。这是 RAG / Pruning 这类"按需检索"工具有效的直接证据。
+
+**失败风格差异**（debug 时很实用）：
+
+| 模型族 | 长 context 失败时的倾向 |
+|---|---|
+| **Claude 系** | 倾向于"低幻觉" — 不知道就说不知道 |
+| **GPT 系** | 倾向于"自信地说错" |
+
+这一条意味着选模型时要看任务对**幻觉容忍度**的要求 — 高可靠场景（医疗 / 法律）应该偏 Claude；探索性场景偏 GPT 可能更愿意"猜一个"。
+
+## 6. 一条贯穿单 agent 范式的主线
+
+四种崩法看起来分散，但放回前面几节的语境里，会发现是同一条主线在不同尺度上反复出现：
+
+```text title="幻觉/坏信息怎么进来、怎么扩散、怎么管住"
+[[react-core]]
+   ReAct 的 grounding 是为了少幻觉（避免 Snowballing / Poisoning 的源头）
+        ↓
+[[reflexion]]
+   想从失败里学，但基于中毒 context 的反思也会错（自我评估上限）
+        ↓
+[[context-engineering]] / [[long-running-techniques]]
+   管理 context 是为了避开 context rot
+        ↓
+本篇
+   把 rot 具体拆成四种脸 — 中毒 / 分心 / 混淆 / 冲突
+   以及为什么 compaction 治得了分心、治不了中毒
+```
+
+整个"单 agent + context" 故事的本质是同一件事 — **坏信息怎么进来、怎么扩散、怎么管住**。看清这个，后续任何 agent 论文都不会觉得概念是孤立的。
+
+## 7. 下一篇 — 把"治法"落到工程
+
+四种崩法 + 学术祖宗已经把"病因"讲透了。但具体怎么治？**RAG / Tool Loadout / Quarantine / Pruning / Summarization / Offloading** 这六种治法分别对应哪种崩法、有什么实证支持、什么时候哪个最有效？
+
+下一篇 [[context-fixes-evidence]] 把六种治法逐个拆开，配数字、配适用场景，给你一个真正可执行的"context debug 工具箱"。其中 Sub-agent Quarantine 这一条会带出 [[multi-agent-debate]] — 那是一场关于"该不该把单 agent 拆成多 agent"的著名争论，也是从单 agent 范式跨到多 agent 范式的桥梁。

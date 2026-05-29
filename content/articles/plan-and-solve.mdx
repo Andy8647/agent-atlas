@@ -5,11 +5,131 @@ cluster: "single-agent-reasoning"
 order: 6
 prerequisites: ["react-core"]
 estimatedMinutes: 10
-summary: "zero-shot 接近 few-shot"
+summary: "用一句 prompt 逼模型先规划再执行 — zero-shot 追平 few-shot 的轻量解药"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: wang2023plansolve
+    authors: "Wang, L., Xu, W., Lan, Y., Hu, Z., Lan, Y., Lee, R. K.-W., & Lim, E.-P."
+    year: 2023
+    title: "Plan-and-Solve Prompting: Improving Zero-Shot Chain-of-Thought Reasoning by Large Language Models"
+    venue: "ACL 2023"
+    url: "https://arxiv.org/abs/2305.04091"
+  - id: kojima2022zerocot
+    authors: "Kojima, T., Gu, S. S., Reid, M., Matsuo, Y., & Iwasawa, Y."
+    year: 2022
+    title: "Large Language Models are Zero-Shot Reasoners"
+    venue: "NeurIPS 2022"
+    url: "https://arxiv.org/abs/2205.11916"
+  - id: wei2022cot
+    authors: "Wei, J., Wang, X., Schuurmans, D., Bosma, M., Ichter, B., Xia, F., Chi, E., Le, Q., & Zhou, D."
+    year: 2022
+    title: "Chain-of-Thought Prompting Elicits Reasoning in Large Language Models"
+    venue: "NeurIPS 2022"
+    url: "https://arxiv.org/abs/2201.11903"
 ---
 
 # Plan-and-Solve
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[react-failures]] 拆出来的第一个大病是 **reasoning error 47%** — ReAct 被"想一句立刻动一下"的结构约束切碎了推理。要治这个病，最朴素的办法是：**在模型开始一步步动之前，先逼它把整道题完整地想一遍**。
+
+Plan-and-Solve（P&S，Wang et al., ACL 2023<Cite id="wang2023plansolve" />）证明这件事可以做得**极轻量** — 改一句 prompt，不动模型、不加工具、不调架构，就能把"漏步错误"显著降下来，甚至让 zero-shot 追平需要 8 个手工范例的 few-shot。
+
+这一篇要讲：P&S 在治的是 [[react-failures]] 中具体哪一类错、它的解法朴素到什么程度、它给后面所有 agent 设计留下了一个什么样的范本。
+
+## 1. 先看清病：Zero-shot CoT 到底错在哪
+
+P&S 出发的对手不是 ReAct，而是更早的 **Zero-shot CoT**<Cite id="kojima2022zerocot" /> — 就是在问题后面加一句 "Let's think step by step"（让我们一步步想）。这招在 GPT-3 时代是个让人惊讶的发现：**不给任何范例**，只加这一句魔法咒语，数学题准确率就能跳一截。
+
+但它显然不完美。Plan-and-Solve 作者人工分析了 Zero-shot CoT 在 GSM8K 数学题上的 46 个答错样本，把错误归成三类：
+
+| 错误类型 | 占比 | 具体含义 |
+|---|---|---|
+| Calculation error（计算错误） | 7% | 算术算错 — 例如 $156 \times 23 = 3580$（实际 3588） |
+| **Missing-step error（漏步错误）** | **12%** | 步骤多的时候，**漏掉了**某个中间推理步 |
+| Semantic misunderstanding（语义理解错误） | 27% | **没读懂题** / 推理结构本身就歪了 |
+
+注意 27% 的语义错误 — 这是 prompt 救不了的，要靠更强的模型。但**12% 的漏步错误**有一个非常具体的病因：**模型在"一步一步想"的过程中，没有先把整道题的步骤骨架定下来，做着做着就忘了中间还要做某步**。
+
+这恰好对应 [[react-failures]] 里讲的 reasoning error 的一个常见形态 — **缺乏全局规划，走着走着丢了某步**。
+
+## 2. 解法：改一句话
+
+P&S 的实现朴素到惊人 — **它只改了那一句触发语**：
+
+```text title="只改 trigger sentence"
+Zero-shot CoT:
+  "Let's think step by step."
+
+Plan-and-Solve (P&S):
+  "Let's first understand the problem and devise a plan to solve the problem.
+   Then, let's carry out the plan and solve the problem step by step."
+  
+  （先理解问题、制定一个计划；然后照着计划，一步步解题。）
+```
+
+就这样。没有 fine-tune、没有新工具、没有 few-shot examples — 就是把"一步一步想"这句话换成"先规划再执行"。
+
+在此之上，**PS+**（P&S 的强化版）再加两句更细的指令，顺便把"计算错误"也压下去：
+
+```text title="PS+ 在 P&S 之上再加两句"
+"extract relevant variables and their corresponding numerals"
+   抽取相关变量和它们的数值
+
+"calculate intermediate results (pay attention to calculation and commonsense)"
+   计算中间结果，注意计算和常识
+```
+
+整个流程仍是 [[react-core]] 里讲过的两步模式：Step 1 用上面这套 prompt 让模型生成"计划 + 推理过程"，Step 2 用一句 "Therefore, the answer is" 把最终答案抽出来。
+
+## 3. 它真的管用？两个数字
+
+**数字一：错误率降了**（GSM8K 100 题人工标注）
+
+| 方法 | 计算错误 | 漏步错误 | 语义错误 |
+|---|---|---|---|
+| Zero-shot CoT | 7% | 12% | 27% |
+| **PS+** | **5%** | **7%** | 27% |
+
+漏步从 12% → 7%，计算从 7% → 5%。**语义错误一动不动**（27%）— 这正是上面说的，"没读懂题"不是加一句计划能救的。
+
+这种"治得了什么、治不了什么"的诚实结果，比一个笼统的"准确率提升了 X%"有用得多 — 它告诉你 P&S 的**作用边界**，避免你把它当万能解药。
+
+**数字二：zero-shot 追平 few-shot**
+
+平均下来，PS+ 在多个数学推理 benchmark 上达到 **76.7%**，逼近 **Manual-CoT** 的 **77.6%**。Manual-CoT<Cite id="wei2022cot" />是 Wei et al. 2022 提出的方法 — 给模型 8 道带详细解答步骤的范例题作为 in-context demonstration，让模型按那个 8 题的解题套路类推。它的代价是要人工挑选 + 写出 8 道高质量范例，且换一个领域就要重做一套。
+
+> [!important] 这条数字背后的工程含义
+> 一句设计得好的 prompt，能顶得上 8 个人工标注的范例题。
+>
+> 这件事的重要性不止"省了几个 example" — 它意味着**很多任务上你根本不需要去搞 few-shot 范例集**。范例集要花人工挑选、写解析、调格式，而且换一个任务就要重做一套；好的 prompt 是任务无关的，**写一次能用很多年**。
+
+## 4. P&S 的真正贡献不是规划本身
+
+P&S 在数字上没多惊人（一句话提升几个百分点），但它的论文细节里藏了一个比数字更重要的发现 — 作者验证 100 个 P&S 预测，**90 个真的包含了一个清晰的 plan**（如"Step 1: 算出 X、Step 2: 用 X 算出 Y、Step 3: ..."）。
+
+这意味着：**"planning ability" 是模型本来就有的能力，只是没被显式唤起。一句话就把它点亮了**。
+
+这个洞察呼应了 [[react-core]] 那条 — ReAct 也没给模型增加任何"新能力"，它只是给 "thought" 这一类输出指定了一个明确的语义位置。两个范式都在做同一件事：**找到一个最小的 prompt 层面干预，把模型本就有但没被结构化使用的能力释放出来**。
+
+> [!tip] P&S 怎么和 ReAct 结合
+> P&S 和 ReAct 不冲突，反而是天然配合 — 现代 agent 常见的模式是：
+>
+> 1. 先用 P&S 风格的 prompt 让模型出一个**整体 plan**（"step 1: ... / step 2: ... / step 3: ..."）
+> 2. 然后用 ReAct loop **按 plan 逐步执行**，每步该调什么工具仍由模型在循环里临场决定
+>
+> 这相当于在 ReAct 外面套了一层 P&S — 既保留 ReAct 在执行时的反应式纠错能力（act-to-reason 还在），又解决了它"没全局视图、被结构切碎推理"的问题。
+
+## 5. P&S 的边界 — 它治不了什么
+
+P&S 的轻量是它最大的卖点，但也是它的天花板：
+
+| P&S 能治 | P&S 治不了 |
+|---|---|
+| 漏步错误（步骤骨架先列出来） | 语义理解错误（读不懂题，加 plan 没用） |
+| 简单计算错误（PS+ 加了"注意算术"提示） | **第一步选错就走不通的任务**（例如 Game of 24：第一步选 "4+9" 就再无回路） |
+| 步数已经隐约可估的任务（数学题、流程性任务） | **需要在多条候选思路间比较、选择的任务**（例如写作风格选型、code 路径选择） |
+
+**第一步选错就走不通**这件事，是 [[tree-of-thoughts]] 那篇文章要解决的问题 — P&S 是线性规划，规划出来的 plan 仍是一条直线。如果你的任务**需要试错、回溯、在多条候选思路间比较**，P&S 的"先想再做"还不够，要把"想"本身的形状改成一棵能搜索、能剪枝的树。
+
+那是下一篇 [[tree-of-thoughts]] 的事，方法论上把成本提高一个数量级（从 ~1 次 LLM 调用变成几十到上百次），换来的能力是探索 + 回溯。**两者不是替代关系，是不同价位的两套解药 — 默认就用 P&S（几乎免费），只在确认任务有"开局定生死"性质时才上 ToT**。

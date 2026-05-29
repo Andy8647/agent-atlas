@@ -18,7 +18,7 @@ export function Navbar() {
 
   return (
     <nav
-      className="flex h-14 shrink-0 items-center justify-between px-5 text-sm"
+      className="relative flex h-14 shrink-0 items-center px-5 text-sm"
       style={{
         background: 'var(--color-surface)',
         color: 'var(--color-text)',
@@ -53,14 +53,14 @@ export function Navbar() {
         <span className="text-[13px] tracking-tight">{SITE_TITLE}</span>
       </Link>
 
-      {/* Center — search trigger (Cmd+K) */}
+      {/* Center — search trigger (Cmd+K). Absolutely centered so progress / icons
+          can grow or shrink on the right without nudging the search bar. */}
       <button
         onClick={() => {
-          // Fire a synthetic Cmd+K to open the command palette
           window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))
         }}
         title="搜索（Cmd/Ctrl + K）"
-        className="hidden h-8 min-w-[280px] items-center gap-2 rounded-md border px-3 text-xs transition-colors hover:bg-[color:var(--color-border)] sm:flex"
+        className="absolute left-1/2 top-1/2 hidden h-8 w-[320px] -translate-x-1/2 -translate-y-1/2 items-center gap-2 rounded-md border px-3 text-xs transition-colors hover:bg-[color:var(--color-border)] sm:flex"
         style={{
           borderColor: 'var(--color-border)',
           background: 'var(--color-bg)',
@@ -85,27 +85,29 @@ export function Navbar() {
         </kbd>
       </button>
 
-      {/* Progress (smaller, optional secondary) */}
-      <div className="hidden items-center gap-2 lg:flex">
-        <div className="flex items-baseline gap-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>
-          <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{completed}</span>
-          <span>/ {allSlugs.length}</span>
-        </div>
-        <div className="h-1.5 w-20 overflow-hidden rounded-full" style={{ background: 'var(--color-border)' }}>
-          <div
-            className="h-full rounded-full transition-all duration-300"
-            style={{ width: `${progressPct}%`, background: 'var(--color-primary)' }}
-          />
-        </div>
-        {inProgress > 0 && (
+      {/* Right group — progress + icons. ml-auto pushes everything to the right
+          edge, so the centered search button stays put regardless of width. */}
+      <div className="ml-auto flex items-center gap-3">
+        {/* Progress block — fixed width so "学习中 N" appearing/disappearing
+            doesn't ripple anything. */}
+        <div className="hidden w-[180px] items-center justify-end gap-2 lg:flex">
           <span className="text-[11px]" style={{ color: 'var(--color-text-muted)' }}>
-            学习中 {inProgress}
+            {inProgress > 0 ? `学习中 ${inProgress}` : ''}
           </span>
-        )}
-      </div>
+          <div className="flex items-baseline gap-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>
+            <span style={{ color: 'var(--color-text)', fontWeight: 600 }}>{completed}</span>
+            <span>/ {allSlugs.length}</span>
+          </div>
+          <div className="h-1.5 w-20 overflow-hidden rounded-full" style={{ background: 'var(--color-border)' }}>
+            <div
+              className="h-full rounded-full transition-all duration-300"
+              style={{ width: `${progressPct}%`, background: 'var(--color-primary)' }}
+            />
+          </div>
+        </div>
 
-      {/* Right — icon buttons */}
-      <div className="flex items-center gap-1">
+        {/* Icon buttons */}
+        <div className="flex items-center gap-1">
         <IconButton
           title={mode === 'dark' ? '切换到浅色模式' : '切换到深色模式'}
           onClick={toggleTheme}
@@ -148,6 +150,7 @@ export function Navbar() {
             <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.4 3-.405 1.02.005 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
           </svg>
         </IconButton>
+        </div>
       </div>
     </nav>
   )

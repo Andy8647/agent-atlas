@@ -4,12 +4,152 @@ slug: "tree-of-thoughts"
 cluster: "single-agent-reasoning"
 order: 7
 prerequisites: ["plan-and-solve"]
-estimatedMinutes: 10
-summary: "BFS/DFS 搜索树+价值函数剪枝"
-widgets: []
-updated: "2026-05-28"
+estimatedMinutes: 12
+summary: "把线性推理变成可探索、可回溯的搜索树 — System 1 外挂 System 2"
+widgets: ["ToTVisualizer"]
+updated: "2026-05-29"
+references:
+  - id: yao2023tot
+    authors: "Yao, S., Yu, D., Zhao, J., Shafran, I., Griffiths, T. L., Cao, Y., & Narasimhan, K."
+    year: 2023
+    title: "Tree of Thoughts: Deliberate Problem Solving with Large Language Models"
+    venue: "NeurIPS 2023"
+    url: "https://arxiv.org/abs/2305.10601"
+  - id: kahneman2011thinking
+    authors: "Kahneman, D."
+    year: 2011
+    title: "Thinking, Fast and Slow"
+    venue: "Farrar, Straus and Giroux"
+    url: "https://us.macmillan.com/books/9780374533557/thinkingfastandslow"
 ---
 
 # Tree of Thoughts
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[plan-and-solve]] 那篇说了它的边界：能治"漏步"和"轻量计算错误"，**治不了"第一步选错就一路走不通"的任务**。这一篇讲 ReAct 同一作者 Shunyu Yao 提出的另一条解药 — **Tree of Thoughts**（ToT，Yao et al., NeurIPS 2023<Cite id="yao2023tot" />）。
+
+ToT 比 P&S 重一个数量级 — P&S 改一句 prompt 几乎免费，ToT 一次推理要几十到上百次 LLM 调用。但它换来的能力 P&S 给不了：**在多条候选思路之间探索、评估、回溯**。这能力把 ReAct/P&S 在 Game of 24（用 4 个数字凑出 24）上 4% 的成功率，干到了 **74%**。
+
+## 1. P&S 没解决的病：一条道走到黑
+
+P&S 再好，它的 plan 仍然是**一条直线**。如果第一步选错了，后面无论怎么努力都到不了答案。
+
+ToT 论文给了一个戳心的实证。Game of 24 任务：给你 4 个数字（如 4, 9, 10, 13），用 +/-/× / ÷ 和括号凑出 24。CoT/P&S 这类线性方法在这个任务上失败时，**大约 60% 的样本是在生成第一步之后就已经注定失败了** — 比如第一步选了 "4 + 9 = 13"，剩下 13, 10, 13 怎么凑也凑不到 24。
+
+但模型并不知道第一步选错了 — 它会"自圆其说"地一路推下去，最后给出一个有信心但错的答案。线性推理（CoT / ReAct / P&S 都是）的根本缺陷被论文一句话戳穿：
+
+> Language models ... are still confined to **token-level, left-to-right** decision-making processes during inference. This means they can fall short in tasks that require **exploration, strategic lookahead, or where initial decisions play a pivotal role**.
+>
+> **中文释义**：LLM 推理时仍是逐 token、从左到右地做决定。这让它在需要**探索、前瞻、或"第一步走错就全盘皆输"**的任务上力不从心。
+
+## 2. 借一个认知科学的框：System 1 vs System 2
+
+ToT 借了 Kahneman 在 *Thinking, Fast and Slow*<Cite id="kahneman2011thinking" /> 里的双系统理论作为设计灵感：
+
+- **System 1**：快、自动、联想式 — 这正是 LLM 逐 token 生成的样子
+- **System 2**：慢、刻意、能停下来对比多条路径、能否定一条试另一条
+
+最具体的 System 2 例子是**解一道数独**：你在 (3, 5) 这一格试填一个 7，往下推几格发现冲突 — 你**擦掉 7、回到 (3, 5)、试填 4** 再走。这个"擦掉重试" 的循环就是 System 2 在工作。你不会像 LLM 那样"沿一条思路 token 接 token 推下去、推到底再说 oops"。
+
+LLM 默认缺这种"主动暂停 + 主动比较 + 主动擦掉"的机制 — 它从左到右一路推，不会自己停下来说"我刚才那步是不是该换一下"。
+
+ToT 想给 System 1 装一个 System 2 的外挂：**把解题过程建模成在一棵树上的搜索**，每个节点是一个 **thought**（一段连贯的、可被独立评估的中间推理单元）。状态 $s = [x, z_1, ..., z_i]$ 就是"原问题 + 到目前为止的想法序列"。
+
+可视化看一眼整棵树（点 "下一步" 看搜索过程）：
+
+<ToTVisualizer />
+
+每个分支生成几个候选 thought，每个 thought 被独立评估（好 / 一般 / 不行），不行的剪掉，好的继续往深走。走到死路就回溯，换条路再试。
+
+## 3. ToT 的四个设计旋钮
+
+ToT 不是一个固定算法，而是一个**框架**，由 4 个可调旋钮构成。理解这 4 个，你就理解了 ToT，也理解了后面大多数"agent + 搜索"的工作。
+
+### 旋钮 1：Thought Decomposition（想法粒度）
+
+一个 thought 多大合适？
+
+- **不能太小**（比如一个 token）：没法独立评估好坏
+- **不能太大**（比如"整个解题计划"）：失去多样性，无法做候选
+
+具体怎么定？取决于任务的天然颗粒度：
+
+| 任务 | 一个 thought 是什么 |
+|---|---|
+| Game of 24（凑 24） | 一个中间等式（"4 + 9 = 13"） |
+| Creative Writing（创意写作） | 一段写作计划（"第一段写背景、第二段引入冲突..."） |
+| Mini Crosswords（小型填字游戏） | 一个候选词的填入 |
+
+### 旋钮 2：Thought Generator（怎么生成候选）
+
+有两种基本策略：
+
+- **Sample（独立采样）**：用同一个 CoT prompt 跑 $k$ 次，靠采样温度产生多样性
+  - 适合**想法空间大、单个想法长**的任务（如写作 — 每段计划可以差异很大）
+- **Propose（一次提议多个）**：用一个 "propose prompt" 让模型一次性提议 $k$ 个不同候选
+  - 适合**想法空间窄、单个想法短**的任务（如 Game of 24 — 候选等式数量有限，独立采样会大量重复）
+
+### 旋钮 3：State Evaluator（怎么评估状态）— ToT 最核心的设计
+
+这是 ToT 最关键、影响也最深远的部件：**用 LLM 自己当启发式（heuristic）**，而不是写死的规则或专门训练的评估模型。两种实现方式：
+
+- **Value（独立打分）**：让模型对每个状态独立打分（1-10，或 sure / maybe / impossible）
+  - 用 few-shot **lookahead（前瞻）** 引导：
+    - "5, 5, 14 → 能凑 24 吗？5+5+14=24，sure"
+    - "1, 2, 3 → 太小了，impossible"
+  - 评估快，结果稳定
+- **Vote（投票比较）**：让模型**比较**多个状态，投出最有希望的
+  - 适合不好直接打分的任务（如"哪段写作更连贯"）
+
+> [!important] 这个设计点的真正分量
+> "**让 LLM 评估自己生成的中间状态、用这个评估来引导搜索**" — 这个想法在整本讲义里会一路长大：
+>
+> - 它是 [[reflexion]] 的近亲（让模型评判自己上次做得好不好）
+> - 它会发展成 [[evaluation]] 那篇里讲的 **LLM-as-judge**（用 LLM 给 agent 输出打分作为 metric）
+> - 它也是 [[multi-agent-debate]] 里 Anthropic 多 agent 系统中"LLM-as-judge 评测子任务"的同款思路
+>
+> 记住这条线：**LLM 不只能生成，还能当裁判**。这是后续所有"自我改进"和"被评估"机制的共同地基 — agent 之所以能 bootstrap 起来，根本上就靠这一条。
+
+### 旋钮 4：Search Algorithm（搜索算法）
+
+- **BFS（广度优先）**：每层保留 $b$ 个最优状态。适合树浅、分支多的任务（Game of 24 只需 3-4 步）
+- **DFS（深度优先）**：深入最优分支，遇到 impossible 就**剪枝 + 回溯**。适合树深、需要走到底再判断的任务（Mini Crosswords）
+
+## 4. 数字：4% → 74%
+
+| 任务 | IO | CoT | CoT-SC | **ToT** |
+|---|---|---|---|---|
+| **Game of 24** | 7.3% | 4.0% | 9.0% | **74%** (b=5) |
+| Creative Writing（连贯度 GPT-4 打分） | 6.19 | 6.93 | — | **7.56** |
+| Mini Crosswords（词级准确率） | &lt;16% | &lt;16% | — | **60%** |
+
+Game of 24 从 CoT 的 4% 一跃到 74%，几乎是数量级的差距。
+
+**ablation 证明回溯和剪枝是关键** — 去掉回溯（变成贪心 BFS，b=1），Mini Crosswords 词级准确率从 60% 掉回 20%。光"生成多候选"不够，必须能**评估 + 选择 + 剪掉错的 + 回退**才管用。这正是 System 2 区别于 System 1 的核心特征。
+
+## 5. 成本：默认不用 ToT
+
+ToT 的能力来自暴力 — 同一道题它内部跑了几十到上百次 LLM 调用。这个成本不是小事：
+
+| | Plan-and-Solve | Tree of Thoughts |
+|---|---|---|
+| 改的是 | 想的**方式**（加规划） | 想的**结构**（线性变树搜索） |
+| 一次推理的 LLM 调用 | ~1 次 | 几十到上百次（生成 × 评估 × 多层） |
+| 治哪类病 | 漏步、轻量计算错 | 开局定生死、需要回溯/试错 |
+| 何时该用 | **默认就该加**，几乎无脑收益 | **只在"第一步可能错且需要试错"的硬任务**上 |
+
+> [!tip] ToT 论文自己的诚实结论
+> 论文 Discussion 节有这么一句：
+>
+> > Deliberate search such as ToT **might not be necessary** for many existing tasks that GPT-4 already excels at.
+> >
+> > （像 ToT 这种刻意搜索，对很多 GPT-4 已经擅长的任务**可能根本不必要**。）
+>
+> 大多数任务不需要 ToT。**先用 P&S 这种 prompt 级规划，只有当你确认任务有"开局定生死、需要探索"的性质时才上 ToT**。一上来就给所有 agent 套搜索树，结果只会又慢又贵 — 这正是 [[workflow-vs-agent]] 里那条 "find the simplest solution possible" 工程纪律的具体应用。
+
+---
+
+到这里讲过的 ReAct / P&S / ToT 都在改进**单次尝试内部**的推理 — 让这一次想得更好、走得更远、回溯更准。它们有一个共同盲区：**整次尝试失败了，下次还是从零开始，没有任何"上次为什么错"的记忆**。
+
+ToT 的回溯只在**一棵树内部**有效；树跑完、任务失败，教训就丢了。[[react-failures]] 里那个 repetitive loop 的毛病本质也是 — agent 不记得自己刚才已经试过这条路且失败了。
+
+能不能让 agent 失败之后用自然语言写一段反思、存进长期记忆、下次带着这条教训重来？这是下一篇 [[reflexion]] — 把"反思 + 跨尝试记忆"做成一种轻量的、语言形态的强化学习。

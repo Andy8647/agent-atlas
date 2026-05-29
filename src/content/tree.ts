@@ -59,8 +59,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "react-core"
           ],
-          "estimatedMinutes": 10,
-          "summary": "幻觉率 0% vs CoT 56%"
+          "estimatedMinutes": 12,
+          "summary": "0% 幻觉的另一面 — Reasoning error 47% / Repetitive loop / 工具拉胯导致的 derail"
         },
         {
           "slug": "plan-and-solve",
@@ -70,7 +70,7 @@ export const treeData: TreeData = {
             "react-core"
           ],
           "estimatedMinutes": 10,
-          "summary": "zero-shot 接近 few-shot"
+          "summary": "用一句 prompt 逼模型先规划再执行 — zero-shot 追平 few-shot 的轻量解药"
         },
         {
           "slug": "tree-of-thoughts",
@@ -79,8 +79,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "plan-and-solve"
           ],
-          "estimatedMinutes": 10,
-          "summary": "BFS/DFS 搜索树+价值函数剪枝"
+          "estimatedMinutes": 12,
+          "summary": "把线性推理变成可探索、可回溯的搜索树 — System 1 外挂 System 2"
         },
         {
           "slug": "reflexion",
@@ -89,8 +89,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "react-failures"
           ],
-          "estimatedMinutes": 10,
-          "summary": "失败→自然语言反思→episodic memory"
+          "estimatedMinutes": 12,
+          "summary": "用自然语言反思代替梯度 — agent 失败后写一句教训，存进记忆，下次重来"
         }
       ]
     },
@@ -195,8 +195,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "long-running-techniques"
           ],
-          "estimatedMinutes": 12,
-          "summary": "Poisoning/Distraction/Confusion/Clash — Drew Breunig 的四种失败模式及其实证"
+          "estimatedMinutes": 13,
+          "summary": "Poisoning / Distraction / Confusion / Clash — Drew Breunig 的四种失败模式 + 学术祖宗"
         },
         {
           "slug": "context-fixes-evidence",
