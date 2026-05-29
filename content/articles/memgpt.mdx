@@ -4,12 +4,191 @@ slug: "memgpt"
 cluster: "tools-and-memory"
 order: 13
 prerequisites: ["memory-basics", "function-calling"]
-estimatedMinutes: 10
-summary: "OS虚拟内存比喻,DMR 32%→93%"
+estimatedMinutes: 12
+summary: "把 context 当 RAM、外部存储当硬盘、用分页机制做长期记忆 — 8K 窗口跑出 93% DMR"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: packer2023memgpt
+    authors: "Packer, C., Wooders, S., Lin, K., Fang, V., Patil, S. G., Stoica, I., & Gonzalez, J. E."
+    year: 2023
+    title: "MemGPT: Towards LLMs as Operating Systems"
+    venue: "arXiv:2310.08560"
+    url: "https://arxiv.org/abs/2310.08560"
+  - id: liu2024lostmiddle
+    authors: "Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., & Liang, P."
+    year: 2024
+    title: "Lost in the Middle: How Language Models Use Long Contexts"
+    venue: "TACL 2024"
+    url: "https://arxiv.org/abs/2307.03172"
 ---
 
-# MemGPT: LLM 即操作系统
+# MemGPT：LLM 即操作系统
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[memory-basics]] 留了两个 RAG 解不掉的问题：
+
+- **写入策略**：什么内容该被存进长期记忆？
+- **检索时机**：agent 怎么知道现在该去查长期记忆？
+
+MemGPT<Cite id="packer2023memgpt" />（Packer et al., Berkeley, 2023）的回答是把整个问题映射到一个**全是工程师都熟悉的领域** — **操作系统的虚拟内存**。
+
+> **核心想法**：把 LLM 当 OS。Context window 是 RAM、外部存储是硬盘，**让 LLM 自己用函数调用做分页换入换出**。
+
+这个类比不仅在比喻层面成立，整套机制可以直接照着搭。实证留到 §5 — 这里先把架构和机制讲清楚。它更深的意义在于：用一个机械的 OS 比喻**第一次完整实现**了后来 Anthropic 抽象成 [[context-engineering]] 三大长程技术的所有原型 — compaction / note-taking / just-in-time retrieval。
+
+## 1. 把 OS 虚拟内存的概念搬来
+
+熟悉 OS 的人对这套机制本能就懂 — 应用程序看似拥有"无限"内存（虚拟地址空间），实际物理内存（RAM）有限。OS 在背后做：
+
+- **物理内存不够时** → 把暂时不用的页换到硬盘（swap out）
+- **程序访问被换出的页时** → 触发 **page fault**，从硬盘换回 RAM（swap in）
+- 应用感觉"内存无限大"，但其实只有一小块 RAM + 一大块硬盘 + 一个分页机制
+
+MemGPT 把这套机制完整搬到 LLM 记忆管理上：
+
+| OS 概念 | MemGPT 对应物 | 干什么 |
+|---|---|---|
+| **CPU** | LLM 本身 | 真正在"运行"的东西 |
+| **RAM（物理内存）** | Main Context（context window，如 8K） | LLM 推理时唯一能"看到"的东西 |
+| **硬盘** | External Context（外部存储） | 容量近乎无限、要"换入"才能用 |
+| **系统调用** | function call | LLM 用 tool_call 主动管理自己的记忆 |
+| **page fault** | retrieval | LLM 需要旧信息时主动调检索工具 |
+| **页面置换策略** | 内存压力触发的分页 | context 接近满时驱逐旧消息 + 生成摘要 |
+
+## 2. 详细架构：Main Context vs External Context
+
+MemGPT 把 LLM 能看到的"内存"（main context）划成三块，外面再接一块"硬盘"（external context）：
+
+```text title="MemGPT 内存层级"
+┌────────────── Main Context（= RAM, context window, 8K） ─────────────────┐
+│                                                                          │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌────────────────────────┐ │
+│  │ System Instructions│  │ Working Context  │  │     FIFO Queue        │ │
+│  │ （只读 / 静态）      │  │ （可读写, 定长块）│  │ （滚动的消息历史）       │ │
+│  │ 讲清控制流 +       │  │ 存关键事实/偏好/  │  │ 最旧那段被换出后        │ │
+│  │ 怎么用记忆函数      │  │ 人设:            │  │ 用递归摘要顶替           │ │
+│  │                  │  │ "生日 2/7"        │  │                       │ │
+│  │                  │  │ "男友叫 James"    │  │                       │ │
+│  └──────────────────┘  └──────────────────┘  └────────────────────────┘ │
+│                                                                          │
+└────────────────────────────────┬─────────────────────────────────────────┘
+                  函数调用换入换出 ↕ (tool_call)
+┌────────────────────────────────┴─────────────────────────────────────────┐
+│  External Context（= 硬盘, 不在窗口里, 用时才检索）                          │
+│  ┌────────────────────────┐    ┌───────────────────────────┐             │
+│  │  Recall Storage         │    │   Archival Storage         │             │
+│  │  完整消息数据库            │    │   任意读写文本库              │             │
+│  │  （查历史对话）            │    │   （向量检索, RAG 入口）       │             │
+│  └────────────────────────┘    └───────────────────────────┘             │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+各部分的具体作用：
+
+| 区域 | 内容 | 谁能改 | 类比 |
+|---|---|---|---|
+| **System Instructions** | MemGPT 自己的元 prompt — 告诉 LLM"你有以下工具来管自己的记忆" | 不变 | OS 内核代码 |
+| **Working Context** | 关键事实和偏好（用户生日、人设、约定） — **常驻不被换出** | LLM 自己（用 tool） | OS 的常驻进程 / 锁页内存 |
+| **FIFO Queue** | 最近 N 条对话消息。最旧那条接近被换出时，被一个"递归摘要"顶替 | 自动 | OS 的 LRU 缓存 |
+| **Recall Storage** | 完整对话历史的备份。可以按时间或关键字检索 | 只读（消息自动存入） | 硬盘里完整的 swap 文件 |
+| **Archival Storage** | 任意文本库 — 用户上传的文档、过往 agent 反思等。向量检索 | LLM 自己写入 + 读取 | 文件系统 |
+
+注意 **Working Context** 这一格 — 它是 MemGPT 对"长期记忆"最聪明的设计：
+
+> **不是把所有东西都丢去外部库等检索 — 把"反复要用的关键事实"主动写进一个常驻的小块里**。
+
+这个设计直接呼应 [[reflexion]] 里"长期记忆只留 1-3 条精华反思"的同款思想 — **记忆系统的核心技艺是"挑出该常驻的那几条"**。
+
+## 3. 让它转起来：两个机制
+
+MemGPT 的关键词是 **self-directed** — LLM **自己用 function call 管理自己的记忆**，不需要外部代码控制。
+
+### 机制 1：自管理编辑与检索
+
+LLM 把自己输出的某些 token 当成 function call 发出去，runtime 拦截执行：
+
+```text title="LLM 在对话中主动管理记忆"
+用户: "我下周生日,2月7号"
+
+LLM 内部输出:
+  → working_context.append("生日 2/7")        ← 这是一次 tool_call,不在用户可见的回复里
+  → "好的,提前祝你生日快乐!"                   ← 这才是回复给用户的
+
+用户(几个月后): "我和 James 分手了"
+
+LLM 内部输出:
+  → working_context.replace("男友 James", "前男友 James")
+  → "听到这个消息很遗憾..."
+
+用户(一年后): "我还记得去年六旗那次去吗?"
+
+LLM 内部输出:
+  → recall_storage.search("six flags")       ← 触发 page fault, 从外部库捞历史
+  ← 检索结果: "2024-08-15 用户和朋友 Sarah 去了六旗..."
+  → "记得呀,你和 Sarah 去的那次..."
+```
+
+**所有这些动作都是 LLM 自主发起的** — System Instructions 教会它"如果遇到 X 情况就 call 这个工具"。这就是为什么这个机制能起名叫 **self-directed**。
+
+### 机制 2：内存压力触发的分页
+
+MemGPT 有一个 Queue Manager 盯着 main context 的 token 数：
+
+```text title="内存压力机制（直接照搬 OS 的页面置换）"
+prompt token 数到 ~70% (warning):
+    → 注入一条系统消息警告 LLM "context 快满了, 重要的事记到 working/archival"
+    → 让 LLM 主动决定哪些 FIFO 消息值得提升到 working context 或 archival
+
+prompt token 数到 ~100% (flush):
+    → 驱逐约 50% 最旧的 FIFO 消息
+    → 用 "旧摘要 + 被驱逐消息" 生成新的递归摘要 (recursive summary)
+    → 被驱逐消息进 recall_storage, 仍可检索回来
+```
+
+注意"递归摘要"这个细节 — 不是每次都从头摘要全历史（那样既慢又会累积失真），而是 **"上一次的摘要 + 这次被驱逐的部分" → 新摘要**。类似 LSM-tree 的 compaction，每次都基于上一次的产物继续压。
+
+## 4. MemGPT 的三个动作 = Anthropic 三大长程技术
+
+这是 MemGPT 最重要的延伸 — 它的三个具体机制，正是后来 Anthropic [[long-running-techniques]] 抽象出来的**三大长程 context 技术**的原型：
+
+| MemGPT 机制 | Anthropic 抽象名称 | 干什么 |
+|---|---|---|
+| 递归摘要（把旧 FIFO 压成摘要） | **Compaction**（压缩） | 用更少的 token 装更多的 context |
+| 主动写 Working Context（记关键事实） | **Note-taking**（记笔记） | 把"该常驻的"信息挑出来固化 |
+| 从 Archival / Recall 按需检索 | **Just-in-time Retrieval**（按需检索） | 旧信息只在被需要时调回 |
+
+MemGPT 用 "操作系统" 这个比喻**机械地实现了这三个动作**。Anthropic 在 [[long-running-techniques]] 里把它们**抽象成通用的工程纪律** — 不再绑死 MemGPT 的具体架构，而是变成"任何长程 agent 都应该有这三个能力"。
+
+这条 "具体实现 → 工程纪律" 的抽象路径，是 agent 工程里常见的演化模式 — 后面 [[long-running-techniques]] 会以更通用的形式回到这三个动作上。
+
+## 5. 结果：赢的不是"更大的窗口"，是"主动管理小窗口"
+
+| 任务 | 固定窗口基线 | MemGPT |
+|---|---|---|
+| **DMR**（Deep Memory Retrieval — 考对话一致性，需翻前几轮对话才答得出） | GPT-4: 32.1% | **GPT-4 + MemGPT: 93.4%** |
+| **Document QA**（超长文档问答） | 受限于 retriever 质量 + 窗口大小 | **主动翻页检索，不受窗口大小限制** |
+| **Nested KV retrieval**（嵌套键值查找） | GPT-4 超过 2 层就崩 | **唯一能稳定做多层**（靠多次查询组合） |
+
+DMR 从 32% 到 93% 是质变。但论文真正的论点不是"分数高"，而是：
+
+> [!important] 核心论点
+> 赢的不是"上下文更大"，而是"对一个有限的上下文做主动的、自管理的换入换出"。
+>
+> - 固定窗口基线的天花板被"retriever 一次性塞进来的东西"卡死
+> - MemGPT 能反复查询、翻页、摘要、改写
+> - 于是用一个 8K 的小窗口做到了大窗口做不到的事
+>
+> 这是 [[memory-basics]] 里立的 mindset 在工程实现层的兑现。
+
+---
+
+cluster 3 到这里讲完。5 篇的因果链：
+
+- **工具线**（[[function-calling]] → [[toolformer]] → [[aci]]）— 机制 → 学会 → 设计
+- **记忆线**（[[memory-basics]] → 本篇）— 框架 → 具体实现
+
+但 cluster 3 全程围绕**单点技术**展开 — Tool Use 或 Memory 各自怎么做好。它没回答一个更上位的问题：
+
+> 当 agent 的 context 里同时塞着 system prompt、工具定义、对话历史、检索回来的记忆、上一轮反思…… 它们**全在抢同一个 attention 预算**时，有没有一套通用纪律来回答"该放什么、怎么塞、什么时候换"？
+
+这是 cluster 4 [[context-engineering]] 的全部命题。Karpathy 在 2025 年点名它"比 prompt engineering 更重要"，Anthropic 随后把它系统化 — MemGPT 的三个机械动作（摘要 / 记笔记 / 按需检索）变成面向**所有 context 内容**的工程原则。

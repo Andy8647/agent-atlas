@@ -106,8 +106,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "react-core"
           ],
-          "estimatedMinutes": 10,
-          "summary": "工具定义→tool_call→回填"
+          "estimatedMinutes": 11,
+          "summary": "ReAct 的 Action 升级版 — 一个 tool 是什么、一轮 tool use 怎么跑"
         },
         {
           "slug": "toolformer",
@@ -116,8 +116,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "function-calling"
           ],
-          "estimatedMinutes": 10,
-          "summary": "自监督学习何时调用API"
+          "estimatedMinutes": 11,
+          "summary": "模型自监督学会何时调工具 — 监督信号是「这个工具的结果能否让后文更好预测」"
         },
         {
           "slug": "aci",
@@ -126,8 +126,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "function-calling"
           ],
-          "estimatedMinutes": 10,
-          "summary": "hashline 案例: 6.7%→68.3%"
+          "estimatedMinutes": 12,
+          "summary": "Agent-Computer Interface — 工具设计的好不好决定 agent 成不成（6.7% → 68.3% 的实证）"
         },
         {
           "slug": "memory-basics",
@@ -136,8 +136,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "react-core"
           ],
-          "estimatedMinutes": 10,
-          "summary": "STM vs LTM, RAG pipeline"
+          "estimatedMinutes": 11,
+          "summary": "短期 vs 长期记忆 — RAG 管道 + 一个必须破除的误解（记忆 ≠ 容量）"
         },
         {
           "slug": "memgpt",
@@ -147,8 +147,8 @@ export const treeData: TreeData = {
             "memory-basics",
             "function-calling"
           ],
-          "estimatedMinutes": 10,
-          "summary": "OS虚拟内存比喻,DMR 32%→93%"
+          "estimatedMinutes": 12,
+          "summary": "把 context 当 RAM、外部存储当硬盘、用分页机制做长期记忆 — 8K 窗口跑出 93% DMR"
         }
       ]
     },

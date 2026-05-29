@@ -4,12 +4,163 @@ slug: "toolformer"
 cluster: "tools-and-memory"
 order: 10
 prerequisites: ["function-calling"]
-estimatedMinutes: 10
-summary: "自监督学习何时调用API"
+estimatedMinutes: 11
+summary: "模型自监督学会何时调工具 — 监督信号是「这个工具的结果能否让后文更好预测」"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: schick2023toolformer
+    authors: "Schick, T., Dwivedi-Yu, J., Dessì, R., Raileanu, R., Lomeli, M., Zettlemoyer, L., Cancedda, N., & Scialom, T."
+    year: 2023
+    title: "Toolformer: Language Models Can Teach Themselves to Use Tools"
+    venue: "NeurIPS 2023"
+    url: "https://arxiv.org/abs/2302.04761"
+  - id: brown2020gpt3
+    authors: "Brown, T. B., Mann, B., Ryder, N., Subbiah, M., Kaplan, J., et al."
+    year: 2020
+    title: "Language Models are Few-Shot Learners"
+    venue: "NeurIPS 2020"
+    url: "https://arxiv.org/abs/2005.14165"
 ---
 
 # Toolformer
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[function-calling]] 讲清楚了一个工具的**机制** — 怎么定义、怎么被一轮 tool use 跑起来。但它没解决一件事：**模型怎么知道什么时候该调工具**？
+
+听起来这是一个废话问题 — 你给它工具描述、它看着描述自己判断不就行了？但 2022 年的现实是：LLM 在一些**简单的事**上反而很差 — 算术算错、查事实搞错、问"今天几号"它只能编。这些恰恰是小工具（计算器、搜索、日历）的强项。但**怎么让模型主动想到"这里我该掏出计算器"**？
+
+当时的两个常见做法都有硬伤：
+
+- **人工标注大量"该在这调工具"的数据 → fine-tune** — 太贵，每加一个新工具都要重标
+- **写 prompt 强制要求模型按特定格式调** — 只能绑死在特定任务上，模型不会"在自然语言里自发地调"
+
+**Toolformer**（Schick et al., Meta, NeurIPS 2023<Cite id="schick2023toolformer" />）给的解法非常优雅 — 用**完全自监督**的方式让模型学会调工具，不需要任何人工标注。这一篇拆它的方法和它带来的洞察 — 不是为了让你照着复刻（现代模型已经内化了这能力），而是为了理解一个对后面 [[context-engineering]] / [[prompt-caching-infra]] 都有用的核心思想：**"信息有没有用 = 它能不能让模型把后文预测得更准"**。
+
+## 1. Toolformer 想要什么
+
+论文一开始就把目标列得很清楚（论文里叫 desiderata，需求清单）：
+
+- **自监督学**：不要人标注"该在这调工具"
+- **模型自己决定** when / how / which 工具
+- **不损失通用语言能力**：学完调工具不能变成只会调工具的 narrow model
+
+这三条加起来非常苛刻。要满足它们，论文给出一个让人拍案的设计 — **用"能不能帮预测下文"当唯一的监督信号**。
+
+## 2. 三步方法 — 整个 paper 的灵魂
+
+整个流程只有三步（论文 Figure 2）。从一段普通文本 `"Out of 1400 participants, 400 passed the test."` 开始：
+
+### Step 1 — Sample（采样候选调用）
+
+用几个 demo（few-shot）让模型在文本可能的位置插入候选 API 调用：
+
+```text title="Step 1 · 在哪些位置插入候选 API 调用"
+Out of 1400 participants, 400 passed [Calculator(400/1400)] the test.
+                                     ↑ 模型自己提议:在这里调计算器
+```
+
+模型这一步只是**提议** — 不知道这个调用是不是真的有用。一段文本可能产出几十个候选位置。
+
+### Step 2 — Execute（执行）
+
+真去把候选 API 调用执行一遍，拿到结果：
+
+```text title="Step 2 · 真去执行"
+[Calculator(400/1400)] → 0.29
+```
+
+### Step 3 — Filter（关键 — 用 loss 反向过滤）
+
+这一步是整个 Toolformer 的灵魂。先简短解释一下 **loss** — 在语言模型里，loss 衡量"模型预测下一个 token 时的不确定度"。模型读完前文后对下一个词越确定，loss 越低；越蒙圈，loss 越高。
+
+Toolformer 的 filter 就是**比较两种 loss**：
+
+```text title="Step 3 · 用「能不能更好预测下文」过滤"
+对每个候选 API 调用,比较两个 loss:
+
+L⁺ = 给模型看「调用 + 结果」时, 预测后文 "(or 29%)" 的损失
+     上下文 = "...400 passed [Calculator(400/1400) → 0.29] the test. " 后接 "(or 29%)"
+     
+L⁻ = 不调用 / 只给调用不给结果时, 预测后文 "(or 29%)" 的损失
+     上下文 = "...400 passed the test. " 后接 "(or 29%)"
+
+判定:
+  如果 L⁻ − L⁺ ≥ τ_f  →  调用结果显著降低了预测损失,有用 → 保留
+  否则                  →  这个工具在这位置没帮上忙 → 丢掉
+```
+
+判定通过的候选，被拼接进训练语料里：
+
+```text title="过滤后的训练样本"
+保留: "Out of 1400 participants, 400 [Calculator(400/1400) → 0.29] passed the test (or 29%)."
+
+丢弃: "Mary went to [Calculator(2+2)] the store."  ← 计算器在这里完全没意义
+```
+
+然后把保留下来的"文本 + 工具调用"拼成新数据集，**用它去 fine-tune 模型**。fine-tune 后的模型在自然语言生成时，遇到要算数的地方就会自然地想到调计算器 — 因为它**从自己的反馈里学到了**这个习惯。
+
+> [!important] Toolformer 最深的洞察
+> Toolformer **从头到尾没有任何人来标注"这里应该调计算器"**。它用的全部监督信号只有一句话：
+>
+> > "如果把工具的返回结果摆进 context 里，模型预测后面那句话会不会更轻松（loss 更低）？"
+>
+> 会 → 工具在这位置有用，保留训练样本。  
+> 不会 → 工具没帮到忙，丢弃样本。
+>
+> 这种思想叫 **"信息的价值由它对预测的边际贡献决定"** — 它在 agent 这个领域反复出现：
+>
+> - [[context-engineering]] 里 "context 该塞什么" → 塞那些**能让后续 token 预测更准**的东西
+> - [[prompt-caching-infra]] 里 "缓存什么" → 缓存那些**能被反复用来生成的**前缀
+> - [[memory-basics]] 里 "记忆该留什么" → 留那些**未来可能被检索回来用上**的事实
+>
+> 记住这条线 — Toolformer 是这个 "loss-as-supervisor" 思路在 agent 领域最早最干净的实现。
+
+## 3. 它真的管用 — 小模型打赢大模型
+
+Toolformer 基于 **GPT-J（6.7B 参数）** 训练。在多个任务上：
+
+| 任务 | 关键对照 |
+|---|---|
+| 数学（ASDiv / SVAMP / MAWPS） | **Toolformer 6.7B 超过 GPT-3 175B<Cite id="brown2020gpt3" />** — 数学任务上 97.9% 的样本它会主动调计算器 |
+| 事实问答（LAMA） | 同样超过 GPT-3 175B — 不会的事实就调 Wikipedia |
+| 多语言（MLQA） | 显著高于基线 — 低资源语言上调翻译 API |
+| 通用语言建模 | **不掉** — 这条很关键，证明"会调工具"和"会写语言"不是 trade-off |
+
+**比 GPT-3 小 25 倍但打赢它** — 这件事的意义不在于"哇省钱了"，而是它**证明了"能力可以来自外部工具，不一定要来自更大的权重"**。
+
+这是一个分水岭式的观察。在 Toolformer 之前，"模型变强" 默认意味着"参数变多 + 训练数据变多"；Toolformer 之后，多了一条**正交**的提升路径 — **把模型不擅长的事委托给工具，模型只学会"什么时候委托"**。
+
+这条路径直接通向今天所有的 agent 系统：模型本身负责"想"，工具负责"算 / 查 / 改 / 跑"。
+
+## 4. 解码细节：怎么知道"该调了"
+
+训练完的 Toolformer 在正常解码时，怎么知道何时该调？设计很简单：
+
+- 模型正常 decode token
+- 当 `"→"`（论文里约定的"我要工具结果了"符号）进入 **top-k = 10** 候选时，**触发调用**
+- 每个输入**最多调 1 次工具** — 防止陷入"一直调 API 不出答案"的循环（你看，又是 [[react-failures]] 那个 loop 问题）
+
+这个"最多调 1 次"是个有意的限制 — 它把 Toolformer 的能力锁在了**"在自然语言生成的某一处主动调一次"**。能不能多次调、能不能链式调（先 search 再 calculator）？**不能**。这是边界。
+
+## 5. 边界 — Toolformer ≠ ReAct
+
+Toolformer 学会了"何时调"，但它**不会做几件事**：
+
+| Toolformer 能做 | Toolformer 做不到 |
+|---|---|
+| 在生成文本时**自发地**插入一次工具调用 | 在多步任务里**链式**调用多个工具 |
+| 选用学过的几个工具中合适的一个 | 看到 search 结果**为空就改写 query 重试** |
+| 调用结果直接拼回文本继续生成 | 在循环里**根据上一步反馈决定下一步** |
+
+正好对照 [[react-core]] — ReAct 恰恰做的是 Toolformer 做不到的事：**在反馈循环里反复调、根据反馈改写、错了再来**。
+
+**两者其实是互补的两层能力**：
+
+- **Toolformer** = 学会"调"（单次、嵌进语言建模）
+- **ReAct** = 学会"在反馈循环里反复调、调错了改"
+
+今天主流模型（GPT-4 / Claude / Gemini）已经把"会调工具"这件事**内化进了训练**，你不用自己跑 Toolformer 那套流程。你看到的现代 agent 框架（比如 SDK 的 tool use 循环）本质上是**在已经会调工具的模型外面套了 ReAct 那一层**。
+
+---
+
+Toolformer 解决的是 "**模型怎么学会调**"。但还有更根本的问题没动 — **工具本身设计得对不对**。Toolformer 假设它要学的工具（计算器、搜索、翻译）接口已经合理；但实际工程里，工具的接口对 agent 来说常常是反人类的。下一篇 [[aci]] 讲 Anthropic 把"为 agent 设计工具"做成一门学问的工程纪律。

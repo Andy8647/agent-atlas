@@ -4,12 +4,248 @@ slug: "aci"
 cluster: "tools-and-memory"
 order: 11
 prerequisites: ["function-calling"]
-estimatedMinutes: 10
-summary: "hashline 案例: 6.7%→68.3%"
-widgets: []
-updated: "2026-05-28"
+estimatedMinutes: 12
+summary: "Agent-Computer Interface — 工具设计的好不好决定 agent 成不成（6.7% → 68.3% 的实证）"
+widgets: ["ComparisonSlider"]
+updated: "2026-05-29"
+references:
+  - id: anthropic2024writingtools
+    authors: "Anthropic"
+    year: 2024
+    title: "Writing Tools for Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/writing-tools-for-agents"
+  - id: yang2024swebench
+    authors: "Yang, J., Jimenez, C. E., Wettig, A., Lieret, K., Yao, S., Narasimhan, K., & Press, O."
+    year: 2024
+    title: "SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering"
+    venue: "NeurIPS 2024"
+    url: "https://arxiv.org/abs/2405.15793"
+  - id: anthropic2024agents
+    authors: "Schluntz, E. & Zhang, B. (Anthropic)"
+    year: 2024
+    title: "Building Effective Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/research/building-effective-agents"
 ---
 
-# ACI: 为 Agent 设计工具
+# ACI：为 Agent 设计工具
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[function-calling]] 讲了工具的**机制**，[[toolformer]] 讲了模型**怎么学会调**。但 [[react-failures]] 里那个挂在那的 23% — **search result error** — 至今没解释。
+
+那 23% 不是模型不会调工具。是**工具本身返回的东西没用** — 搜了没结果、返回格式难解析、关键字段是 UUID 看不懂、错误信息只丢一个错误码。模型推理再好、循环再稳，工具拉胯它就 derail。
+
+Anthropic 把"为 agent 设计工具"这件事正式命名为 **ACI（Agent-Computer Interface）**，并在 *Building Effective Agents*<Cite id="anthropic2024agents" /> 里立了一条非常直白的纲：
+
+> One rule of thumb is to think about how much effort goes into human-computer interfaces (HCI), and plan to invest just as much effort in creating good **agent-computer interfaces (ACI)**.
+>
+> **中文释义**：你花多少心思设计给人用的图形界面（HCI），就该花多少心思设计给 agent 用的工具界面（ACI）。
+
+听起来像一句宣言，但它有一个非常硬的实证支撑 — SWE-agent 那篇论文<Cite id="yang2024swebench" />给出了一个标志性数字：**只改了 agent 编辑代码文件的工具接口、模型一字没动**，SWE-bench 准确率从 **6.7% → 68.3%**。这把"工具设计是个工程瓶颈"从一句口号变成无法忽略的事实，详见 §3。
+
+## 1. 为什么不能照搬给开发者的 API：context 是稀缺资源
+
+ACI 的所有原则都建立在**一个根本观察**上：
+
+> 传统软件**内存便宜、可以逐条遍历**；agent 的 **context 是稀缺资源**。
+
+举一个具体例子（[[function-calling]] 那一篇也提过，这里展开）。给开发者用的"通讯录"API：
+
+```python title="给开发者用的 API（直接给 agent 用会出问题）"
+list_contacts(limit?: int) → Contact[]   # 列出所有联系人
+get_contact(id: string)   → Contact      # 按 UUID 取一个联系人
+```
+
+开发者代码会这么用：
+
+```python title="开发者代码：先列后取"
+contacts = list_contacts()           # 拿到 500 个联系人列表
+for c in contacts:                    # 内存里 O(1) 遍历
+    if c.name == "张三":
+        target = get_contact(c.id)
+        break
+```
+
+把这两个工具原封不动给 agent 呢？agent 一调 `list_contacts()` 就**把 500 条联系人全塞进 context** — 至少几千 token 没了。然后它得在 context 里"逐 token 读"找张三 — 这正是 LLM 最不擅长的 [[memory-basics]] 里讲的"长 context 中间召回差"的场景。
+
+为 agent 重新设计同一个能力：
+
+```python title="为 agent 设计的工具：直接搜索 + 返回精简"
+search_contacts(query: string, limit: int = 5) → Contact[]
+```
+
+一次调用、5 个结果、几百 token 解决。**省下的是 agent 最稀缺的 context 预算**。
+
+这个例子的本质是：**把计算从 agent 的 context 里挪回到工具实现里**。`list + 遍历` 的工作量没有消失，只是从"agent 在 context 里读 500 行"挪到了"工具内部直接 SQL 查询 5 条"。后者快几个数量级、还不浪费 token。
+
+## 2. ACI 五原则
+
+Anthropic *Writing Tools for Agents*<Cite id="anthropic2024writingtools" /> 把"为 agent 设计工具"的工程纪律收成 5 条原则。每条都直接对应一种具体的失败模式：
+
+### 原则 1：挑对工具，别全包
+
+少而精。**别只是包一层现有 API** — 让"开发者 API 一对一映射成 agent 工具"是最常见的反模式。
+
+**正例**：与其给 agent 3 个零散工具（`get_customer_info` / `get_customer_orders` / `get_customer_tickets`），不如给一个 `get_customer_context(customer_id)` 一次返回客户的所有信息 — 那 3 个调用是 agent 几乎总是连着调的，合并掉等于省 2 轮 LLM 调用。
+
+**治的病**：工具太多/重叠会**分散** agent 的注意力（对应 [[context-failure-modes]] 里的 **Distraction**）。
+
+### 原则 2：命名空间（namespacing）
+
+按服务 / 资源给工具加前缀，让 agent 一眼能区分。
+
+**反例**：`search` 这个工具在 Asana 上下文里和 Jira 上下文里都叫 search，agent 用一会儿就开始混。
+
+**正例**：`asana_search` / `jira_search` — agent 看名字就知道在哪个系统里搜。
+
+**治的病**：工具语义重叠时 agent 选错（对应 [[context-failure-modes]] 里的 **Confusion**）。
+
+### 原则 3：返回有意义的 context — 别给 agent 看 UUID
+
+工具返回的字段要**让模型一眼能理解**。
+
+**反例**：
+
+```json title="坏的返回 — agent 看不懂"
+{
+  "user_id": "550e8400-e29b-41d4-a716-446655440000",
+  "asset_id": "94d9d3f1-8c2a-4f01-aabb-bb5d2c8b7c5e",
+  "mime_type": "image/jpeg",
+  "size_bytes": 248521
+}
+```
+
+**正例**：
+
+```json title="好的返回 — 字段名 + 值都对 agent 友好"
+{
+  "user_name": "张三",
+  "asset_name": "summer-vacation-2025.jpg",
+  "asset_type": "photo",
+  "size": "243 KB"
+}
+```
+
+UUID 对模型完全没意义 — 它读到 `"550e8400-..."` 这种字符串只能照抄回去，不能基于它做推理。Anthropic 报告：**把 UUID 解析成自然语言字段能显著降低幻觉**。
+
+补一条：给工具加 `response_format: concise | detailed` 开关 — agent 想要简版就给简版，想要详细就给详细，省 context。
+
+### 原则 4：token 效率 — 假设 context 永远会爆
+
+工具能返回的数据可能很大（一个搜索可能返回几千行日志）。设计时假设**任何返回都可能撑爆 context**：
+
+| 手段 | 怎么用 |
+|------|------|
+| **分页** | 默认返回前 N 条，加 `page` / `cursor` 参数让 agent 翻 |
+| **范围选择** | 比如 `read_file(path, start_line, end_line)`，别一次返回整个文件 |
+| **过滤** | 让 agent 传过滤条件给工具，不要 agent 拿全集再筛 |
+| **截断 + 合理默认** | Claude Code 默认把工具返回截到 25k token，超过部分给一句"已截断，请用更窄的过滤" |
+| **错误信息可执行** | 不要丢 `Error: 500`。返回 `Error: file not found at /a/b. Did you mean /a/c?` — 让 agent 知道下一步怎么做 |
+
+### 原则 5：工具描述做 prompt engineering
+
+工具的 `description` 字段**就是 prompt** — 模型完全靠它判断该不该调、传什么参数。所以要像给新同事写文档那样写：
+
+| 坏 | 好 |
+|---|---|
+| `"Search logs"` | `"Search application logs from the last 7 days. Returns matching lines with 5 lines of context above and below. Use for debugging recent errors."` |
+| 参数 `user` | 参数 `user_id`（更精确） + description 说明格式 |
+| 不写 example | 在 description 里写 1-2 个 example call |
+
+> [!note] 描述的小改动 → 效果剧变
+> Claude 3.5 在 SWE-bench 上拿 SOTA，靠的就是 Anthropic 在工具 description 上反复打磨。
+
+## 3. 标志性实证：SWE-agent 的 6.7% → 68.3%
+
+SWE-agent 那篇 paper<Cite id="yang2024swebench" />做了一个非常彻底的对照实验。SWE-bench 任务（让 agent 修真实的 GitHub bug）的基线 — 用 GPT-4 + 一组"开发者风格"的工具（直接给 shell 命令、读写文件用标准 IDE 接口）：
+
+```text title="基线工具集（开发者风格）"
+shell_command(cmd: string) → output
+read_file(path: string) → str
+write_file(path: string, content: string) → bool
+```
+
+**准确率：6.7%**。听起来很糟糕，但这正是"把开发者 API 直接给 agent"的真实代价。
+
+SWE-agent 团队**只改了工具接口**（不动模型、不加数据、不换 prompt 框架）：
+
+```text title="ACI 设计的工具集"
+# 文件操作变成「窗口式编辑」— agent 看到的是一个有行号、有视口的"窗口"
+open(path)            → 在"编辑器窗口"打开文件,显示前 100 行 + 行号
+scroll(direction)     → 在窗口里翻页
+goto(line)            → 跳到某行
+edit(start, end, content) → 替换某几行（窗口立刻刷新显示）
+search_file(query)    → 在当前文件搜
+search_dir(query)     → 在仓库搜
+
+# 错误处理改成「可执行的反馈」
+edit() 失败时 → 直接返回"语法错误在 line X，未提交"（agent 能照着改）
+```
+
+**准确率：68.3%**。模型一字没动 — 仅仅换了工具接口，benchmark 提升一个数量级。
+
+为什么差这么多？拆开看 3 个具体机制：
+
+**机制 1：窗口隐喻让 agent 把文件当持续状态，而不是一次性文本流**
+
+基线的 `read_file` 每次返回整个文件 — agent 看到的是一段静态文本，编辑要靠 `write_file` 全文件覆盖。一旦文件超过几百行，agent 在 context 里读一遍就吃掉几千 token；改一行还要把整个文件原样吐回（容易意外删别的）。
+
+ACI 工具集的 `open` + `scroll` + `goto` 让 agent **看到的是一个有行号、有视口的"编辑器"** — 文件状态在工具实现里持续维护，agent 只需要发"翻到第 200 行"这种小命令。读 1 万行的文件不会撑爆 context（只看当前 100 行 viewport）。
+
+**机制 2：edit 带行号 + 立即反馈让"试错 → 修正"循环变得可能**
+
+基线的 `write_file` 是一次性提交。如果新内容有语法错误，文件已经被破坏，agent 还不知道。
+
+ACI 的 `edit(start_line, end_line, content)` 是**局部替换 + 立即在 viewport 里显示结果**。语法错误会触发返回 `"语法错误在 line 215，未提交"` — agent 直接看到要修哪里，自然进入下一轮 `edit` 修正。这正是 [[react-core]] 的反馈循环在工具层的实例化。
+
+**机制 3：search 工具让 agent 不用读完文件就定位**
+
+基线没有结构化的 search — agent 想找一个函数只能 `read_file` 整个文件然后 grep。ACI 的 `search_file` / `search_dir` 直接返回匹配位置和行号，agent 直接 `goto` 过去。
+
+这 3 个机制叠在一起，agent 处理代码时的工作流从"读完整个文件 → 在脑子里改 → 全文件覆盖"变成"搜索定位 → 局部编辑 → 跑测试 → 修正" — 后者**和人类程序员的实际工作流接近多了**。
+
+可以拖一下下面这个对照 widget，直观看两套工具接口在同一个修 bug 任务上让 agent 看到的"画面"有多不一样：
+
+<ComparisonSlider />
+
+> [!warning] 一个让人无法回避的事实
+> 同一个 GPT-4，同一批 SWE-bench 题，唯一变量是工具接口设计 → **6.7% vs 68.3%**。
+>
+> 这意味着：agent 在大多数 benchmark 上的表现被它的**工具接口**而不是模型本身严重 cap 住了。大家天天关注"换更强模型涨多少分"，但工具这一侧在很多任务上有 10× 的杠杆没被利用。
+>
+> 这就是为什么 Anthropic 说他们打磨工具的时间比打磨 prompt 还多。
+
+## 4. 一个真实的工具优化案例
+
+光说原则太抽象。看 Anthropic 自己的 Claude web search 工具上线后的具体优化：
+
+**问题**：Claude 上线 web search 后，团队发现一个怪现象 — Claude **多此一举地在 query 里加上 "2025"**（比如用户问 "What's the latest GPT model" Claude 会去搜 "latest GPT model 2025"），结果搜索引擎被这个时间戳带偏，返回了一堆质量低的 SEO 页面，反而拉低性能。
+
+**修法不是改模型，是改工具描述**：
+
+```text title="改前的工具 description"
+"Search the web. Returns top results."
+```
+
+```text title="改后"
+"Search the web. Returns top results.
+
+ IMPORTANT: Do NOT add date/year qualifiers to your query unless the user
+ explicitly mentions a year — search engines already prioritize recent content,
+ and adding years often returns SEO-optimized pages of lower quality."
+```
+
+**效果**：准确率回升。
+
+更值得看的是 Anthropic 的**工具优化工作流**：
+
+1. 搭原型 → 跑评估（几十个真实任务）
+2. **把评估 transcript 喂给 Claude Code，让它自己分析 + 自己重构工具**
+
+这是一个非常元的循环 — **用 agent 来优化 agent 的工具**。但它生效，因为模型最知道"模型自己看到什么样的工具会用得顺"。
+
+---
+
+Tool Use 这条腿讲完了。但 ACI 第 4 条原则（token 效率）整条都在和一堵墙搏斗 — **所有工具的返回最终都要塞进 context**。一个设计精良的 read_file 工具一次返回 100 行也是 100 行 token；多调几次，context 就会饱和。
+
+下一篇 [[memory-basics]] 进入三件套的第三条腿 **Memory** — 当对话历史、工具返回、反思记录加起来超过 context window 时怎么办？答案不是"开大窗口"。

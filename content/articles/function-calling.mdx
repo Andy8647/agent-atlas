@@ -4,12 +4,168 @@ slug: "function-calling"
 cluster: "tools-and-memory"
 order: 9
 prerequisites: ["react-core"]
-estimatedMinutes: 10
-summary: "工具定义→tool_call→回填"
+estimatedMinutes: 11
+summary: "ReAct 的 Action 升级版 — 一个 tool 是什么、一轮 tool use 怎么跑"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: anthropic2024writingtools
+    authors: "Anthropic"
+    year: 2024
+    title: "Writing Tools for Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/writing-tools-for-agents"
+  - id: openai2023functioncalling
+    authors: "OpenAI"
+    year: 2023
+    title: "Function calling and other API updates"
+    venue: "OpenAI Blog"
+    url: "https://openai.com/index/function-calling-and-other-api-updates/"
+  - id: yao2023react
+    authors: "Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao, Y."
+    year: 2023
+    title: "ReAct: Synergizing Reasoning and Acting in Language Models"
+    venue: "ICLR 2023"
+    url: "https://arxiv.org/abs/2210.03629"
 ---
 
 # Function Calling 机制
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[react-core]] 把动作空间形式化为 $\hat{A} = A \cup L$，里头的"真实动作 $A$"长这样：`Search[Apple Remote]`。这是 2022 年的文本约定 — 模型吐出一行带方括号的文本，外面的 Python 用正则去解析成函数调用。
+
+到 2023 年 OpenAI 和 Anthropic 几乎同时把它**结构化**了 — 你不再写 `Search[Apple Remote]`，而是写一个 JSON `{"name": "search", "arguments": {"query": "Apple Remote"}}`。这就是今天所有 agent SDK 都在用的 **function calling**（也叫 **tool use**）。
+
+底层逻辑一字未改 — 它就是 ReAct 的 Action 那一行换了个序列化格式。但这次换格式带来一个完全不同的范式：**模型从「会输出文本格式的工具调用」升级成「输出格式由 SDK 强制保证、参数被 JSON Schema 验证」**。这一篇拆 function calling 的机制，理解了它，你就理解了今天所有 agent 框架的工具部分。
+
+## 1. 一个工具到底是什么
+
+把 function calling 的"工具"分解到最朴素的形态，它只有三样东西：
+
+```text title="一个 tool 的定义 = 三样东西"
+name:         "search_logs"
+description:  "搜索应用日志，返回相关行 + 上下文 5 行"
+input schema: {
+  "query":  { "type": "string", "description": "搜索关键词" },
+  "limit":  { "type": "integer", "default": 20, "description": "最多返回行数" }
+}
+```
+
+| 元素 | 给谁看 | 它在干什么 |
+|------|--------|------|
+| **name** | 模型 + runtime | 唯一标识。模型靠它知道"我要调哪个工具"，runtime 靠它派发到对应的 handler 函数 |
+| **description** | **模型** | 关键 — 模型完全靠这段文字判断**"什么时候该调这个工具"** |
+| **input schema** | 模型 + runtime | 参数类型定义（用 [JSON Schema](https://json-schema.org/) 这个标准格式描述 — 比如 "query 是 string、limit 是 integer 且默认 20"）。让模型知道要传哪些参数，让 runtime 能验证模型输出的合法性 |
+
+整套定义被序列化后塞进发给 LLM 的请求里 — 模型每次推理时看着这份"工具说明书"决定要不要调、调哪个、传什么参数。
+
+## 2. 一轮 tool use 的完整流程
+
+一轮 tool use 是 4 步：
+
+```python title="一轮 tool use · 拆开看"
+# Step 1 — 把工具定义随 message 一起发给模型
+response = llm.create(
+    messages=[
+        {"role": "user", "content": "找出过去 1 小时报错的日志，告诉我哪个服务最严重"}
+    ],
+    tools=[search_logs_tool, count_by_service_tool]  # 上面定义的两个工具
+)
+
+# Step 2 — 模型决定要调工具，返回一个 tool_call
+# response.message =
+# {
+#   "role": "assistant",
+#   "tool_calls": [{
+#     "id": "call_abc",
+#     "name": "search_logs",
+#     "arguments": '{"query": "ERROR", "limit": 100}'
+#   }]
+# }
+
+# Step 3 — 你的代码真去执行这个 tool_call
+result = search_logs(query="ERROR", limit=100)
+# result = "2026-05-29 14:23 ERROR auth-svc ... (97 more lines)"
+
+# Step 4 — 把执行结果当成新 message 回填进 history，再发给模型
+response = llm.create(
+    messages=[
+        ...,  # 之前的所有消息
+        {"role": "assistant", "tool_calls": [...]},  # 模型上轮输出
+        {"role": "tool", "tool_call_id": "call_abc", "content": result},
+    ],
+    tools=[...]
+)
+# 模型可能再调一次工具（count_by_service），也可能直接给最终答案
+```
+
+注意 Step 4 这件事 — **tool 结果回填后，模型基于"原 prompt + 上轮 tool_call + tool 结果"再做下一轮决策**。这就是 [[react-core]] 里那个 `while llm(history)` 循环 — function calling 没改 loop，它只是把 loop 里的 Action 这一步换成了结构化协议。
+
+## 3. 对比 ReAct 文本协议 vs 现代 function calling
+
+直观对比一下两个时代的同一件事：
+
+| | ReAct（2022） | Function Calling（2023+） |
+|---|---|---|
+| 工具描述格式 | 写进 prompt 文本里："你有一个工具 search[x]" | 单独的 `tools` 参数，JSON Schema |
+| 模型输出 | `Action: search[Apple Remote]`（自由文本） | `{"name": "search", "arguments": {...}}`（结构化 JSON） |
+| 你的代码 | 写 regex 去解析 `Action:` 这行 | SDK 直接给你 `tool_calls` 对象 |
+| 错误处理 | 模型可能输出格式怪的 action，正则崩 | SDK 强制输出 valid JSON，参数被 schema 验证 |
+| 多工具 | 写一段长 prompt 解释每个工具 | tools 数组里列每个工具的 name/desc/schema |
+| 并行调用 | 不支持 — 一次只能一个 Action | 支持 — 模型可以一次输出多个 tool_call |
+
+结构上的差异看起来只是"换了个序列化格式"，但实际效果完全不同：
+
+- **可靠性**：JSON 输出和 schema 验证消灭了 90% 的"format error"
+- **多工具协同**：让 agent 调度 10+ 个工具变得现实（虽然过多还是有 [[aci]] 里讲的混淆问题）
+- **生态**：standardized 后才出现 MCP（Model Context Protocol）这种跨厂商工具协议
+
+底层的 `while llm(history)` 循环没动。**新协议给的是工程层面的可靠性，不是新能力** — 这点要看清楚，不然容易把"function calling"误以为是某个新的智能突破。
+
+## 4. Tool 这个词的真正定义
+
+Anthropic 在 *Writing Tools for Agents*<Cite id="anthropic2024writingtools" /> 里给了一个让人重新看待"工具"的定义：
+
+> **Definition (Tool)**：Tools are a new kind of software which reflects a contract between **deterministic systems and non-deterministic agents**.
+>
+> **中文释义**：传统函数是"确定性系统之间的契约" — `getWeather("NYC")` 每次都以完全相同的方式取纽约天气。**而工具是"确定性系统"和"非确定性 agent"之间的契约**：同样问"今天要带伞吗"，agent 可能调天气工具、可能凭常识答、可能先反问你在哪 — 它甚至可能幻觉一个调用。
+
+这句话是后面 [[aci]] 整篇文章的总纲：
+
+> 因为另一端是非确定性的模型，**所以工具不能照"给开发者用的 API"那样写，得"为 agent 而设计"**。
+
+这个"非确定性 + context 是稀缺资源"的双重约束直接导致：**给开发者的 API 不能原封不动给 agent 用**。最经典的反例是"通讯录列表 + 按 ID 取详情" — 开发者代码可以先 list 再 get，但给 agent 这两个工具意味着它要把全部联系人读进 context 才能找到目标。
+
+[[aci]] 那一篇把这种"为 agent 重新设计接口"的工作系统化成 5 条原则，并给出一个让人震撼的实证：只改了 SWE-bench agent 编辑文件的工具接口、模型完全没动，准确率提升一个数量级。
+
+## 5. 一个真实的多步 tool use trace
+
+把上面所有概念串起来 — 看一个 agent 用 3 个工具完成一个复杂任务的完整 trace：
+
+```text title="任务：'帮我把上周失败的订单整理成报告'"
+─── Round 1 ────────────────────────────────────────
+模型输出: tool_call → query_orders(status="failed", date_range="last_week")
+执行结果: 找到 47 单失败订单（截断显示前 5 单）
+─── Round 2 ────────────────────────────────────────
+模型输出: tool_call → group_by(records=[...], field="failure_reason")
+执行结果: 分组结果 {"timeout": 23, "card_declined": 15, "fraud_check": 9}
+─── Round 3 ────────────────────────────────────────
+模型输出: tool_call → create_doc(
+    title="上周失败订单分析",
+    content="共 47 单失败...\n主要原因分布：timeout 49%、card_declined 32%..."
+)
+执行结果: 文档已创建，URL = https://docs.example.com/abc123
+─── Round 4 ────────────────────────────────────────
+模型输出: is_final_answer = True
+         content = "报告已生成: https://docs.example.com/abc123 ..."
+```
+
+这里每一轮模型都基于 history（包括之前所有 tool 结果）决定下一步。注意 Round 3 的 content — 它**没有列出全部 47 单，而是先用 tool 聚合再写报告**。这种"工具组合"是 function calling 的精髓 — 它让 agent 能用少量原子工具完成开放式任务。
+
+## 6. 不在范围内的（防止你过早期待）
+
+Function calling 这一篇只讲**机制** — "工具长什么样、一轮怎么跑"。它**不解决**两件事：
+
+- **模型怎么学会调工具** — 早期模型要 fine-tune 才会用 function calling，2023 年 [[toolformer]] 给了一个优雅的"自监督学会调工具"的答案，今天的主流模型已经内化了这个能力
+- **工具怎么设计才好用** — 这是 [[aci]] 的全部内容。L1 ReAct 里那个 23% 的 search result error，本质上不是模型不会调工具，是**工具本身返回的东西没用**
+
+下一篇 [[toolformer]] 拆模型怎么"自监督学会何时调工具" — Meta 2023 那篇 paper 给的方法极有美感，它的核心思想（"工具有没有用 = 它的答案能不能帮模型把后文预测得更准"）在后面 [[context-engineering]] / [[prompt-caching-infra]] 里还会以不同形态反复出现。
