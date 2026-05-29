@@ -164,8 +164,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "memory-basics"
           ],
-          "estimatedMinutes": 10,
-          "summary": "注意力预算,context rot,n²根因"
+          "estimatedMinutes": 11,
+          "summary": "注意力预算 + context rot — 从「写 prompt」到「策划整个 context 配置」"
         },
         {
           "slug": "context-design",
@@ -174,8 +174,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "context-engineering"
           ],
-          "estimatedMinutes": 10,
-          "summary": "按需检索,progressive disclosure"
+          "estimatedMinutes": 11,
+          "summary": "按需检索 + progressive disclosure — 落到 system prompt / tools / examples 三大部件"
         },
         {
           "slug": "long-running-techniques",
@@ -185,8 +185,8 @@ export const treeData: TreeData = {
             "context-design",
             "memgpt"
           ],
-          "estimatedMinutes": 10,
-          "summary": "Compaction/Note-taking/Sub-agents"
+          "estimatedMinutes": 12,
+          "summary": "Compaction / Note-taking / Sub-agent — 当 token 总量超过窗口时"
         },
         {
           "slug": "context-failure-modes",
@@ -205,8 +205,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "context-failure-modes"
           ],
-          "estimatedMinutes": 10,
-          "summary": "六治法+学术证据链"
+          "estimatedMinutes": 12,
+          "summary": "六种治法对症下药 + Chroma 18 模型实证 + 工具数量崩坏曲线"
         }
       ]
     },

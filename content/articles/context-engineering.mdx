@@ -4,12 +4,205 @@ slug: "context-engineering"
 cluster: "context-engineering"
 order: 14
 prerequisites: ["memory-basics"]
-estimatedMinutes: 10
-summary: "注意力预算,context rot,n²根因"
-widgets: []
-updated: "2026-05-28"
+estimatedMinutes: 11
+summary: "注意力预算 + context rot — 从「写 prompt」到「策划整个 context 配置」"
+widgets: ["AttentionCurve"]
+updated: "2026-05-29"
+references:
+  - id: anthropic2024contextengineering
+    authors: "Anthropic"
+    year: 2024
+    title: "Effective Context Engineering for AI Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
+  - id: karpathy2025context
+    authors: "Karpathy, A."
+    year: 2025
+    title: "Context Engineering > Prompt Engineering"
+    venue: "X (Twitter) thread"
+    url: "https://x.com/karpathy/status/1937902205765607626"
+  - id: liu2024lostmiddle
+    authors: "Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., & Liang, P."
+    year: 2024
+    title: "Lost in the Middle: How Language Models Use Long Contexts"
+    venue: "TACL 2024"
+    url: "https://arxiv.org/abs/2307.03172"
 ---
 
 # Context Engineering 总论
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[memgpt]] 用"操作系统"这个具体比喻**机械地**解决了对话记忆的换入换出。但它逼出了一个更上位的问题 — 一个 agent 的 context 里同时塞着**好几种东西**：
+
+- system prompt（[[agent-architecture]] 里的 prompt 那一层）
+- 工具定义（[[function-calling]] / [[aci]]）
+- 对话历史（[[react-core]] 里 ReAct 的 history）
+- 检索回来的长期记忆（[[memory-basics]] 的 RAG）
+- 反思记录（[[reflexion]] 的长期 mem）
+
+**它们全在抢同一个有限的"注意力预算"**。MemGPT 只管了其中"对话记忆"那一块。有没有一套**通用的纪律**来回答：**面对有限的注意力预算，到底该往里塞什么、怎么塞、什么时候把旧的换掉**？
+
+这就是 **Context Engineering** — Karpathy 在 2025 年点名<Cite id="karpathy2025context" />"它比 prompt engineering 更重要"，Anthropic<Cite id="anthropic2024contextengineering" />随后把它系统化。它是 [[agent-architecture]] 里 `prompt → context → harness` 三层阶梯的**中间一环**。
+
+这一篇先把 context engineering 是什么、为什么重要立住，后面三篇 [[context-design]] / [[long-running-techniques]] / [[context-fixes-evidence]] 是它的具体落地。
+
+## 1. 它和 prompt engineering 是什么关系
+
+要理解 context engineering，先把它和你熟悉的 **prompt engineering** 的关系钉清楚。Anthropic 的定义：
+
+> **Definition (Context Engineering)**：The set of strategies for **curating and maintaining the optimal set of tokens** during LLM inference, including all the other information that may land there outside of the prompts.
+>
+> **中文释义**：在 LLM 推理过程中，**策划并维护"最优 token 集合"**的一整套策略 — 不只是 prompt，**还包括所有会落进 context 的其他信息**（system 指令、工具定义、外部数据、消息历史、检索结果……）。
+
+核心的认知转变 Anthropic 一句话点透：
+
+> 问题从 prompt engineering 的 **"该写什么词？"**，变成了 context engineering 的 **"什么样的 context 配置，最可能让模型产生我们想要的行为？"**
+
+两者最关键的差别是**时态**：
+
+| | Prompt Engineering | Context Engineering |
+|---|---|---|
+| **任务性质** | 一次性的（写好一个 system prompt 就 deploy） | **迭代的** — agent 每跑一轮，都要重新决定"这一轮往窗口里塞什么" |
+| **主要对象** | system prompt 那段话 | 不断演化的"可能相关信息全集"里，**该筛哪些进有限窗口** |
+| **时间尺度** | 上线前打磨 | 运行时持续决策 |
+
+注意第二行 — context engineering 面对的不是一段静态文本，是一个**膨胀的信息宇宙**：
+
+```text title="Agent 运行时 context 里都在抢空间"
+有限的 8K / 32K / 200K 窗口
+        ↓ 在抢空间的"东西"
+        ├── system prompt
+        ├── 5 个工具定义 (每个 ~500 token)
+        ├── 之前 10 轮对话历史
+        ├── 上一轮检索回来的 3 段记忆
+        ├── 上一轮 tool 调用结果 (12k token!)
+        ├── 用户最新的提问
+        └── 还要给模型"输出空间"
+```
+
+每一轮 LLM 推理时，**你（更准确说是你写的 agent 代码）都要决定** — 这一堆东西**全塞进去**？还是**先压缩一下历史**？还是**把 tool 结果摘要一下**？还是**这几条记忆这次不需要不调入**？这些**运行时决策**就是 context engineering 的核心。
+
+## 2. 为什么重要：注意力预算 + Context Rot
+
+要理解 context engineering 为什么是一门独立的学问，得理解一个具体现象：**context rot（上下文腐烂）**。
+
+> **Context Rot**：as the number of tokens in the context window increases, the model's ability to accurately recall information from that context **decreases**.
+>
+> **中文释义**：窗口里 token 越多，模型从里面**准确召回**信息的能力**越差**。所有模型都有这个特性（有的衰减温和些）。
+
+Anthropic 给了一个核心隐喻 — **attention budget（注意力预算）**：
+
+> 像人的工作记忆容量有限，LLM 也有一份有限的注意力预算 — **每多塞一个 token，就消耗一点这份预算**。
+
+这个隐喻不是修辞 — 它有非常具体的根因。
+
+### 根因 1：Transformer 架构的 $O(n^2)$
+
+Transformer 的自注意力机制让**每个 token 都要 attend 到其他每个 token**（"attend"在这里的直观意思就是"参考一下"）。$n$ 个 token 就有 $n^2$ 对参考关系：
+
+```text title="Self-attention 是 O(n²) 的"
+2 个 token:  2² = 4 对关系
+10 个:       10² = 100 对
+100 个:      100² = 10000 对
+1000 个:     1000² = 100万对
+8000 个:     8000² = 6400万对
+```
+
+为什么这是问题？想象你在一个会议室里讲话，要同时盯所有人的表情来判断该说什么 — 5 个人你能看清每一张脸，500 人就只能瞄一眼大概的气氛。模型也一样，它的"注意力"是固定预算，不是平均分给每对 token 的无限资源 — **token 越多，每对关系分到的注意力就越稀薄**。
+
+这就是 "context size 和 attention focus 之间有天然张力" 的具体含义。
+
+> [!important] $O(n^2)$ 是 infra 层在硬刚的东西
+> 应用层（context engineering）的做法是 "**少塞点 token**，绕开 $n^2$ 的副作用"。
+>
+> 推理引擎那一层（vLLM / SGLang 之类）的做法是 "**直接啃 $n^2$**" — 用更高效的 GPU kernel、更聪明的 KV cache 管理、或者改变 attention 的数学形式。**同一个敌人，两个战场**。应用层学 context engineering 是为了在现有 attention 下用好它；infra 层是想把 attention 本身变快。
+
+### 根因 2：训练数据的分布偏置
+
+第二个原因更隐蔽 — **训练数据里短序列更常见**。模型对"跨整个长上下文的依赖"经验更少，专用参数也更少。结果就是：
+
+> **性能渐变（performance gradient），不是断崖**。长上下文里模型仍然能干活，但召回精度和长程推理会变差。
+
+这个"渐变"是 context engineering 存在的根本理由 — **窗口越长，每个 token 的"边际价值"越低**。塞 200K 不等于得到 200K 的工作能力，可能只得到 50K 的有效能力（其他 token 在干扰）。
+
+### 一个具体的"衰减形状"
+
+[[context-failure-modes]] 那篇里详细讲了 Liu et al. 的 *Lost in the Middle*<Cite id="liu2024lostmiddle" /> — 关键信息放在 context 中间时召回最差，呈一条 U 形曲线：
+
+<AttentionCurve />
+
+这条曲线就是 attention budget 不均匀分配的最直接证据 — 不是"窗口越长越差"那么简单，而是**位置也有影响、内容也有影响、组合方式也有影响**。这才是为什么 context engineering 不是"少塞点就行"，而需要专门一套方法论。
+
+这条 U 形曲线只是 context 出问题的 4 种典型样态之一（叫 **Distraction，分心**）。完整的失败分类在 [[context-failure-modes]] 里 — 4 种崩法（Poisoning 中毒 / Distraction 分心 / Confusion 混淆 / Clash 冲突）+ 3 个学术祖宗 paper 都摆得很清楚。这一篇先立"为什么 context engineering 是一门学问"的总论，cluster 4 后面 3 篇会逐个展开。
+
+## 3. 唯一指导原则
+
+把上面所有东西收束到一句话 — 整个 context engineering 就这一句话：
+
+> [!tip] Anthropic 的原文
+> Good context engineering = finding the *smallest* possible set of *high-signal* tokens that maximize the likelihood of some desired outcome.
+>
+> 找到"最小的、高信号的 token 集合"，最大化想要的结果出现的概率。
+
+注意 "最小" 不等于 "最短"。完成任务需要的信息不能省 — 但每一个 token 都得**挣得它占的那点注意力预算**。"可能相关"不够，"这一步推理实际用得上"才是高信号。
+
+这条原则把 [[memory-basics]] 里立的 mindset 从"记忆"推广到了**所有** context 内容：
+
+> 不是 context **多大**的问题，是 context 里**每个 token 是否值得**的问题。
+
+## 4. 一个落到代码的对照例子
+
+光说原则太抽象。看一个具体场景 — 写一个回答客户支持问题的 agent：
+
+```python title="prompt-engineering 风格（静态、一次性）"
+SYSTEM_PROMPT = """
+你是 SaaS 公司的客服 agent。你知道下面这些产品信息：
+
+[产品 1 详细介绍 - 2000 字]
+[产品 2 详细介绍 - 2000 字]
+[产品 3 详细介绍 - 2000 字]
+...
+[产品 10 详细介绍 - 2000 字]
+
+请基于以上信息回答用户问题。
+"""
+# 每次 LLM 调用都送 20000 字进 context — 不管用户问的是哪一款
+```
+
+```python title="context-engineering 风格（迭代、按需）"
+SYSTEM_PROMPT = """
+你是 SaaS 公司的客服 agent。当你需要产品信息时,调 search_product_docs 工具。
+"""
+
+def run_agent(user_question):
+    while not done:
+        # 每一轮都重新决策 context 里放什么
+        context = [
+            SYSTEM_PROMPT,              # 始终在
+            recent_history[-3:],         # 只留最近 3 轮 (不是全历史)
+            current_task_notes,          # agent 写的笔记
+            user_question,
+        ]
+        
+        step = llm(context, tools=[search_product_docs, ...])
+        
+        # 如果模型调了 search，把产品信息按需检索回来,只把相关的塞进去
+        if step.is_tool_call:
+            result = execute(step)
+            # tool result 太长? 截断或摘要后再回填
+            context.append(compress_if_needed(result))
+```
+
+第二种写法的本质 — **context 不是上线前写死的一段 prompt，是 agent 每轮运行时动态拼出来的**。它包括但不限于：
+
+- 什么时候**记** — `current_task_notes` 是 agent 自己维护的笔记（[[long-running-techniques]] 的 note-taking）
+- 什么时候**取** — `search_product_docs` 是按需调的工具（即将讲的 just-in-time retrieval）
+- 什么时候**压** — `compress_if_needed` 在 tool result 超过阈值时摘要（compaction）
+- 什么时候**丢** — `recent_history[-3:]` 只保留最近 3 轮
+
+这 4 类决策合起来就是 context engineering 的核心工程问题。后面三篇会逐个展开。
+
+---
+
+总论立完了 — "最小高信号集合"是原则，attention budget + context rot 是为什么。下一步把它落到代码。
+
+[[context-design]] 讲三个最常见的 context 部件该怎么设计 — system prompt、tools、examples — 以及一个改变 agent 用 context 方式的核心范式 **just-in-time retrieval**（按需取用，而不是预先全塞）。

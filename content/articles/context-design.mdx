@@ -4,12 +4,260 @@ slug: "context-design"
 cluster: "context-engineering"
 order: 15
 prerequisites: ["context-engineering"]
-estimatedMinutes: 10
-summary: "按需检索,progressive disclosure"
+estimatedMinutes: 11
+summary: "按需检索 + progressive disclosure — 落到 system prompt / tools / examples 三大部件"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: anthropic2024contextengineering
+    authors: "Anthropic"
+    year: 2024
+    title: "Effective Context Engineering for AI Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents"
 ---
 
 # Context 设计原则
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[context-engineering]] 立了原则 — **找到最小的、高信号的 token 集合**。但"高信号"这个词太抽象。实际工程里，context 里有三类不同的部件：
+
+- **System prompt** — 长期、相对稳定的指令
+- **Tools** — 工具定义（[[function-calling]] 那一篇讲了机制，[[aci]] 讲了怎么设计单个工具）
+- **Examples** — few-shot 范例
+
+每一类的"高信号"标准不一样，落到工程上要分别设计。这一篇先讲三类部件各自的设计原则，再讲一个**贯穿所有部件**的核心思路 — **just-in-time retrieval**（按需取用）。
+
+## 1. System Prompt：找对"高度"
+
+System prompt 最常见的两种失败方式是**镜像对称**的：
+
+| 失败方式 | 表现 | 为什么会发生 |
+|---|---|---|
+| **太低（写死）** | 一堆脆弱的 if-else 硬编码逻辑，想精确控制每个行为 | 工程师的本能是"写代码控制一切"，但语言模型不是代码 — 你写得越细它越容易钻空子 |
+| **太高（太泛）** | 空洞的高层指导，假设了模型没有的共识 | "Be helpful" 这种话每个模型都"听不见" |
+
+Anthropic 把"找到中间那个对的高度"叫做 **right altitude**：
+
+> System prompt 应该**足够具体到能引导行为，又足够灵活给模型留启发式空间**。
+
+### 两个反例（先看两边再看中间）
+
+**太低 — 写死成 if-else**（截取关键几行示意，原版往往有 50+ 行）：
+
+```text title="太低 · 把 prompt 写成代码"
+你是 code review agent。
+如果 PR 改了 *.py → 先跑 pytest；
+如果 pytest 失败 → 在 review 里贴出第一个失败的 test 名；
+如果改了超过 500 行 → 标注 "too large, split"；
+... [再 50 行 if-else]
+```
+
+**问题**：写不全（PR 形态有 1000 种）+ 维护成本巨大（每改一条规则都要担心和别的冲突）+ 模型反而被限制（它本来能处理"先看 diff 摘要"的自然路径，被 prompt 框死必须按顺序做）。
+
+**太高 — 空话**：
+
+```text title="太高 · 没任何具体信号"
+你是一个专业、细致、有帮助的 code reviewer。
+请尽你所能给出高质量的 review。
+```
+
+**问题**：模型完全不知道"你能调什么工具"、"什么时候该 escalate"、"什么算 high-quality review"。每个模型对 "专业" 的理解不一样，你期望的版本它不一定 deliver。
+
+### Right Altitude — 给方向，不写流程
+
+```text title="恰当 · 给方向 + 工具 + 判断准则,不写每步流程"
+<role>
+你是一个 code review agent,负责审查 GitHub PR。
+</role>
+
+<capabilities>
+工具:
+- read_file(path) - 读文件内容
+- read_diff(pr_id) - 读 PR diff
+- search_codebase(query) - 在仓库里搜
+- post_comment(pr_id, body) - 提交 review 评论
+
+不要假装知道你没读过的代码。
+</capabilities>
+
+<judgment>
+1. 先 read_diff 看改了什么
+2. 涉及核心模块时,read_file 看上下文
+3. 不熟悉的 API 用法 — search_codebase 找相似用法
+4. 评论要具体到行号 + 给修改建议
+5. 不确定时,留 "需要 maintainer 确认" 的注释,不要瞎判断
+</judgment>
+```
+
+这段 prompt 给了模型清晰的方向（角色、工具、判断准则），但**没写死每一步流程** — 先看哪个文件、什么时候搜 codebase、怎么组织评论结构，都留给模型临场决定。
+
+### 一个实操建议
+
+> [!tip] Right Altitude 的工程方法
+> Anthropic 推荐的实操路径：
+>
+> 1. **先用最小可行的 prompt 在最强模型上测**（比如 Claude Opus / GPT-5） — 看它在没有任何特殊指导时能做到什么程度
+> 2. **跑评估**，记录失败 case 的具体模式
+> 3. **按失败模式补具体指令** — 不要预先假设它会失败什么
+>
+> 这反过来 — 不是"先写一堆 if-else 再删冗余"，而是 "**先给空白，按失败补**"。这条原则比任何具体规则更重要。
+
+## 2. Tools：最小、不重叠
+
+这一条直接呼应 [[aci]] — 工具集设计的核心原则。
+
+[[aci]] 那一篇详细讲了**单个工具**该怎么设计（5 条原则）。这里讲**工具集整体**该怎么挑：
+
+> 最常见的工具集失败模式是**臃肿** — 功能太多、或者"该用哪个"边界模糊。
+
+Anthropic 有一句话值得贴在墙上：
+
+> **如果一个人类工程师都说不清这种情况该用哪个工具，就别指望 agent 能做得更好**。
+
+具体的"臃肿"症状：
+
+| 症状 | 例子 | 治法 |
+|---|---|---|
+| **功能重叠** | 同时有 `search_users` 和 `find_user` | 合并、删一个 |
+| **粒度太碎** | `get_user_name(id)` + `get_user_email(id)` + `get_user_phone(id)` | 合成 `get_user_info(id)` |
+| **边界模糊** | `query` vs `search` 谁该处理什么 | 明确划分 + 命名空间区分 |
+| **总数过多** | 30+ 个工具 | [[context-failure-modes]] 里讲过：超过 30 个工具大多数模型开始混淆 |
+
+[[aci]] 那篇里讲过的"合并高频链式操作"思路也用在这一层 — 如果 agent 几乎总是连着调 `lookup_order` → `get_order_items` → `get_shipping_info`，那就给它一个 `get_order_full_context(order_id)`。3 个工具变 1 个，省 2 轮 LLM 调用、省 context、省时间。
+
+## 3. Examples（Few-shot）：策划而非堆砌
+
+很多人对 few-shot examples 的本能反应是 "**例子越多越好**" — 把所有 edge case 都塞进去。Anthropic 的建议恰好相反：
+
+> 别把所有 edge case 塞进 prompt。**精选一组多样的、典型的例子**就好 — 对 LLM 来说，**例子是顶一千句话的"图片"**。
+
+具体怎么挑？两个原则：
+
+**原则 1：多样性优于完整性**
+
+```text title="坏 — 3 个例子都长得一样"
+Example 1: "我要退款" → "好的,请提供订单号"
+Example 2: "I want a refund" → "Sure,please share your order number"  
+Example 3: "退我钱" → "好的,请提供订单号"
+```
+
+3 个例子覆盖的是同一种情况（用户主动说"退款"），模型从中学不到额外信息。
+
+```text title="好 — 3 个例子覆盖 3 种不同的对话风格"
+Example 1: "我的订单还没到" → 引导查物流（不是直接退款）
+Example 2: "I want a refund" → 询问退款原因 + 查订单状态
+Example 3: "买的产品和描述不符,我要投诉" → 转人工 + 留存对话
+```
+
+3 个不同方向，模型能学到"客服不是一类问题，要按情况分流"。
+
+**原则 2：典型 > 极端**
+
+放最典型的、覆盖 80% 场景的例子。极端的 edge case 留给运行时的 fallback 处理（"不确定时升级到人工"），不要在 prompt 里穷举。
+
+### 把 §1-§3 收成一句话
+
+Anthropic 把这三层的总纪律压成一句话：
+
+> **informative, yet tight（信息够，但要紧）**。
+
+## 5. Just-in-Time Retrieval：按需取用
+
+上面 3 节都在讲"**预先**应该塞什么"。但很多信息**不该预先塞** — 它只在某些具体情况下才需要。这就要引入 context engineering 里和 RAG 紧密相关的另一个核心范式：**just-in-time retrieval**。
+
+### 转变：从 "全塞" 到 "留指针 + 按需取"
+
+传统 RAG 的做法是 **"推理前用 embedding 把所有可能相关的数据一次性检索好塞进去"** — 你拿到用户问题就用 embedding 找 top 10 相关文档，全塞进 prompt。
+
+just-in-time retrieval 反过来：
+
+> Agent 只维护一些**轻量指针**（文件路径、存好的查询、网页链接），运行时**用工具动态把数据拉进 context**。
+
+这就像人 — **我们不背下整个 Wikipedia**，而是用搜索引擎、书签、收藏夹这些**外部组织 + 索引**，要用时才取。
+
+### 一个具体例子
+
+考虑一个 code review agent，被让审一个 PR：
+
+```text title="预先全塞 — 浪费 context"
+[完整 PR diff: 500 行]
+[完整的 src/ 目录列表: 200 个文件]
+[所有相关测试文件内容: 3000 行]
+[过去 10 个类似 PR 的 review 历史: 5000 行]
+
+请审这个 PR
+```
+
+10000+ token 的 context — 但 agent 实际可能只看 5 个文件 + 1 个测试 + 2 个历史 PR。**剩下 80% 都是浪费的预算**。
+
+```text title="按需取 — 留指针 + 动态拉"
+[PR 元数据: PR 标题/作者/branch + 5 行 diff 摘要]
+[工具: read_file, search_dir, get_pr_history(query)]
+
+请审这个 PR。你可以用工具按需读取相关文件。
+```
+
+Agent 自己决定：
+
+1. 先 `read_file('CHANGELOG.md')` 看上下文
+2. 看 diff 涉及哪几个文件 → `read_file` 那几个
+3. 看是否有相关测试 → `search_dir('test_xyz')` 找
+4. 想看类似 PR → `get_pr_history('similar refactor')`
+
+每一步**只把当下需要的拉进 context** — 总 token 数可能是预先全塞的 1/5。
+
+### Progressive Disclosure：元数据本身就是信号
+
+just-in-time retrieval 还有一个值得注意的细节：**元数据本身就是信号**。
+
+例子：
+
+```text title="文件路径里藏着用途信息"
+tests/test_utils.py              ← 测试相关
+src/core_logic/test_utils.py     ← 业务逻辑相关 (名字相似但用途完全不同)
+docs/test_utils_examples.md      ← 文档
+```
+
+同名文件，路径告诉了 agent **用途完全不同**。文件夹层级、命名约定、时间戳，**都在告诉 agent "该不该读、什么时候读"** — 不需要把内容真读进 context 才能判断。
+
+这种 **"先看元数据再决定要不要拉全量"** 的模式叫 **progressive disclosure（渐进式揭示）** — agent 一层层探索、逐步拼出对系统的理解，而不是一上来淹没在全量信息里。
+
+### 权衡：什么时候 just-in-time，什么时候预先全塞
+
+just-in-time retrieval 不是万能的：
+
+| 偏向预先全塞 | 偏向 just-in-time |
+|---|---|
+| 信息量小（< 几千 token） | 信息量大 |
+| 几乎肯定会用到 | 只在某些情况下用 |
+| 不变的（产品规格） | 经常变的（实时数据） |
+| 检索质量不可靠 | 有好的检索工具 |
+
+Anthropic 的实操指导是**混合策略** — Claude Code 把 `CLAUDE.md`（项目核心信息）**直接塞进 context**，其余的用 `glob` / `grep` / `read_file` 按需取。这避开了"预建索引会过期"的问题，同时保证关键信息**始终在场**。
+
+> [!tip] 一条务实的指导原则
+> Anthropic 反复引的一句话：**"do the simplest thing that works"**。
+>
+> 不要为了"用上 just-in-time"而把所有信息都改成按需取。先看哪些信息你确定每次都要 → 那些直接塞；剩下的才考虑按需。这条原则会在 [[long-running-techniques]] 和 [[multi-agent-debate]] 里反复回来。
+
+## 6. 三种设计原则的关系
+
+最后把这一篇的内容收束一下：
+
+```text title="Context 部件设计 → 运行时 retrieval 策略"
+设计阶段 (上线前):
+  - System prompt → right altitude (不太低不太高)
+  - Tools         → 最小、不重叠
+  - Examples      → 多样的典型例子,不堆 edge case
+
+运行时 (每一轮 LLM 推理):
+  - 哪些信息预先塞 (相对静态、必用)
+  - 哪些信息留指针、按需取 (大、可能用、有检索工具)
+  - 留指针的信息靠工具 + 元数据 progressive disclosure
+```
+
+设计阶段管的是"基础铺垫"，运行时管的是"动态填充"。两者合起来才是完整的 context engineering。
+
+---
+
+设计 + 运行时是一回事的两面 — 任何时候 context 都能装下任务时它们够用。但当任务长到 **token 总量本身就超过窗口**（几小时的研究、大代码迁移、长对话），就需要专门的长程技术。下一篇 [[long-running-techniques]] 讲三个：**Compaction / Note-taking / Sub-agent**。
