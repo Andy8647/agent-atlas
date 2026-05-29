@@ -4,12 +4,227 @@ slug: "harness-loop"
 cluster: "multi-agent-production"
 order: 21
 prerequisites: ["harness-overview"]
-estimatedMinutes: 10
-summary: "Claude Code nO,Codex turn.rs"
+estimatedMinutes: 11
+summary: "Claude Code nO + Codex turn.rs — 裸 ReAct loop 在生产环境下的完整工程外壳"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: promptlayer2024claude
+    authors: "PromptLayer"
+    year: 2024
+    title: "Reverse Engineering Claude Code's Master Loop"
+    venue: "promptlayer.com"
+    url: "https://promptlayer.com/blog/claude-code-master-loop"
+  - id: fulton2025codex
+    authors: "Fulton, J."
+    year: 2025
+    title: "Inside the Agent Harness: Reading Codex Source Code"
+    venue: "jonathanfulton.com"
+    url: "https://jonathanfulton.com/codex-harness"
 ---
 
 # 主循环与请求构造
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[harness-overview]] 给了一张 harness 的部件图，从这一篇开始挨个拆。先拆部件 ①（请求构造）和**主循环本身的骨架**。
+
+[[react-core]] 里的 ReAct 循环是 6 行代码 — 实际生产代码里这 6 行被加上几层工程外壳：分层 system 指令、结构化历史、动态工具集、超时处理、流式输出、错误重试。这一篇用 Claude Code 的 `nO`<Cite id="promptlayer2024claude" /> 和 OpenAI Codex 的 `turn.rs`<Cite id="fulton2025codex" /> 作为 case study，看裸 ReAct 怎么被升级到生产级。
+
+## 1. 请求构造：分层的 system 指令
+
+[[react-core]] 那段示意代码里 system 指令是一个字符串。实际生产 agent 的 system 指令是**分层**的：
+
+```text title="生产 agent 的 system 指令分层"
+┌─ Layer A: 基础人格 (base persona) ─────────────────────────┐
+│ "You are an AI assistant for coding tasks. Always..."       │
+│ — 不变,每次都在最前面                                          │
+└────────────────────────────────────────────────────────────┘
+┌─ Layer B: 用户 / 项目级指令 (user customization) ──────────┐
+│ — 来自 CLAUDE.md / .codexrc 之类的项目配置                    │
+│ "This project uses Python 3.11. Don't use raw SQL..."        │
+└────────────────────────────────────────────────────────────┘
+┌─ Layer C: 工作流 / Skill (skills, plugins) ────────────────┐
+│ — 当前激活的 skill / 流程指令                                  │
+│ "Currently running: code-review workflow"                    │
+└────────────────────────────────────────────────────────────┘
+┌─ Layer D: 当前会话状态 (session state) ───────────────────┐
+│ — TodoWrite 当前任务表 / approval 状态等                       │
+│ "Current TODO: [x] read auth.py [ ] fix login bug"           │
+└────────────────────────────────────────────────────────────┘
+```
+
+为什么要分层？
+
+- **Layer A** 几乎从不变 → **最佳缓存目标**（[[prompt-caching-infra]] 那篇详讲）
+- **Layer B** 跟项目走，变化频率低 → 也能被缓存
+- **Layer C** 跟 skill 切换走 → 不缓存或粒度较小
+- **Layer D** 每轮都变 → 必须在最后面
+
+这正是 [[context-engineering]] 里"最小高信号集合"的具体工程化，也是 [[prompt-caching-infra]] 里"稳定的放前面、动态的放后面"那条 prompt 缓存纪律的直接来源。
+
+## 2. 历史不是纯文本 — 用 call_id 保留因果
+
+裸 ReAct 的 history 长这样：
+
+```text title="裸 ReAct history(2022 年风格)"
+User: 帮我看下 auth.py 有没有 bug
+Assistant: Thought: 先读 auth.py
+Action: read_file("auth.py")
+Observation: [文件内容...]
+Assistant: Thought: 看到了一个空指针风险
+...
+```
+
+整段是纯文本，模型靠**字面**识别 "Action: → Observation:" 的因果。这种格式在 2022 年管用，但生产里**容易出问题** — 模型可能把 Observation 文字理解成"用户说的话"，或者忘记某个 Action 和某个 Observation 是配对的。
+
+生产 agent 把 history 改成**结构化**：
+
+```python title="结构化 history · Codex 风格"
+history = [
+    {"role": "user", "content": "查 auth.py 有没有 bug"},
+    {
+        "role": "assistant",
+        "content": "我先读一下这个文件。",
+        "tool_calls": [
+            {"id": "call_abc123", "name": "read_file", "args": {"path": "auth.py"}},
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_abc123",   # ← 关键: 用 id 链回到上面那个 call
+        "content": "(auth.py 的内容...)",
+    },
+    {
+        "role": "assistant",
+        "content": "在 line 42 有一个潜在空指针...",
+    },
+]
+```
+
+关键是 **`tool_call_id`** — 它把"模型说的'我要调 read_file'"和"工具返回的'文件内容'"显式链起来。模型读 history 时知道这两条是配对的，**不会把 tool 结果误当成用户说的话**。
+
+这是 [[function-calling]] 那篇里讲过的现代 tool use 机制在 history 层面的延伸 — 不只是请求时 tool_call 是结构化的，history 里**已经发生过的** tool_call 也保留结构。
+
+## 3. 工具集是动态的，不是预先全塞
+
+裸 ReAct 假设工具集是固定的 — 一开始你给 agent 配 5 个工具，整个 session 都是这 5 个。
+
+生产 harness **每轮动态决定这次该送哪些工具给模型**。理由是 [[context-failure-modes]] 里讲过的 Confusion — **工具越多模型越容易混**。三个常见的动态裁剪规则：
+
+| 规则 | 例子 |
+|---|---|
+| **按当前权限** | 用户没给写文件权限 → 不发 `write_file` |
+| **按 sandbox 状态** | 当前 sandbox 不能联网 → 不发 `web_fetch` |
+| **按对话主题** | 用户在问 SQL，几轮内都和数据无关 → 暂时不发 `send_email` |
+
+Codex 的 turn.rs 里这部分是显式的：
+
+```rust title="Codex turn.rs · 动态工具集"
+let tools = compose_tools(
+    &session.permissions,
+    &session.sandbox_state,
+    &session.recent_intent,
+);
+let response = llm.call(&messages, &tools);  // 每轮发出去的 tools 不一样
+```
+
+这就是 [[context-fixes-evidence]] 里讲的 **Tool Loadout（动态选工具）+44%** 那条治法在 harness 里的实现。
+
+## 4. 主循环的工程外壳
+
+主循环本身（[[react-core]] 那 6 行）在生产里被裹上几层：
+
+### 流式输出（streaming）
+
+不能等模型把整轮回复生成完再处理。生产 harness 用 streaming — 一边接收 token 一边解析：
+
+```python title="流式主循环 · 简化版"
+for chunk in llm.stream(messages, tools=tools):
+    if chunk.is_text:
+        ui.append_text(chunk.text)        # 立即显示给用户
+    elif chunk.is_tool_call_start:
+        # 已经确定要调工具,可以提前准备 sandbox
+        prepare_sandbox(chunk.tool_name)
+    elif chunk.is_tool_call_complete:
+        # 工具调用参数齐了,立即开始执行
+        spawn_tool_execution(chunk.tool_call)
+```
+
+流式有两个好处：
+
+- **用户体验** — agent "边想边说"，不用等几十秒看到第一个字
+- **并行准备** — 工具执行可以和 LLM 生成**重叠**（模型还在补一个 token，sandbox 已经在 spin up）
+
+### 超时与重试
+
+LLM API 调用会失败 — 网络抖动、模型过载、5xx 错误。生产 harness 必须处理：
+
+```python title="带超时和重试的 LLM 调用"
+def call_llm_with_retry(messages, tools, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return llm.call(
+                messages,
+                tools=tools,
+                timeout=60.0,  # 单次调用 60 秒超时
+            )
+        except (TimeoutError, ServerError) as e:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 指数退避
+            log_retry(e, attempt)
+```
+
+注意 — **工具执行失败和 LLM 调用失败要分开处理**。工具失败要回填给模型让它自己决定怎么办；LLM 调用失败是 harness 层的事，应该 retry 或者报错给用户。
+
+### 实时插话（Claude Code 的 `h2A`）
+
+Claude Code 有一个用户体验上特别"跟手"的特性 — 你可以**在 agent 正在干活的时候插话**，agent 会立刻读到你的新消息并调整行为，**不需要等当前 turn 完成**。
+
+实现这个特性的是 Claude Code 内部的 `h2A` 组件 — 一个**异步双缓冲队列**：
+
+```text title="h2A 双缓冲队列示意"
+主循环线程:
+   ├── 读 input_queue (用户的最新消息)
+   ├── 发 LLM 请求
+   ├── 同时 poll input_queue (用户中途新消息?)
+   └── 中途新消息进来 → 当前请求取消 → 用新消息开下一 turn
+
+UI 线程:
+   ├── 接收用户输入
+   └── 推进 input_queue
+```
+
+这个机制没有对应任何"算法"概念 — 它是**纯工程**能力，但它决定了 Claude Code 用起来"跟手"。这是 harness 工程里大量这种"算法不解决，工程才解决"的细节之一。
+
+### 终止条件
+
+[[react-core]] 那个循环的终止条件是 "模型不再调工具"。生产 harness 还要加几个保护：
+
+| 终止条件 | 触发什么 |
+|---|---|
+| 模型不再调工具（自然终止） | 当前 turn 结束，等用户下一个输入 |
+| 超过 `max_turns`（比如 30 轮） | 强制停止，告诉用户"任务可能陷入循环" |
+| 超过 `max_tokens` 总预算 | 强制停止，给一个成本警告 |
+| 用户主动按 Ctrl+C | 优雅取消，保存当前状态 |
+
+`max_turns` 这条是 [[react-failures]] 里讲的 **repetitive loop（重复循环）** 在 harness 层的兜底 — 即使 [[reflexion]] 那种"自己写反思"的机制还没启动，harness 也得有个**断路器**防止 agent 把 token 烧光。
+
+## 5. 把 [[react-core]] 和生产 harness 摆一起对照
+
+最后把"裸 ReAct"和"生产 harness 主循环"摆一起：
+
+| 元素 | [[react-core]] 裸版 | 生产 harness |
+|---|---|---|
+| **system 指令** | 一个字符串 | 4-5 层分层（base / project / skill / session） |
+| **history** | 纯文本拼接 | 结构化消息，`call_id` 链工具调用 |
+| **工具集** | 启动时固定 | 每轮动态裁剪（权限 / sandbox / 主题） |
+| **输出** | 等待完整回复 | 流式（streaming），UI 实时显示 |
+| **错误处理** | 没有 | 超时 + 指数退避重试，分级处理 |
+| **中途插话** | 没有 | `h2A` 异步队列 |
+| **终止条件** | `is_final_answer` | + `max_turns` + `max_tokens` + Ctrl+C |
+
+这张表的每一行都是 [[react-core]] 那个 6 行循环在生产环境下**必须补的**工程能力。任何一项缺失，agent 在真实场景里都会出问题。
+
+---
+
+下一篇 [[harness-tools-context]] 拆 harness 的另两个核心部件 — **工具执行流水线**（Codex 的 6 步标准流程）和 **Context Manager**（自动 compaction、token-aware 截断、context diffing）。这两个部件是 cluster 3 / 4 全部内容在 harness 里的实现入口。

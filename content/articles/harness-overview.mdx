@@ -4,12 +4,173 @@ slug: "harness-overview"
 cluster: "multi-agent-production"
 order: 20
 prerequisites: ["agent-architecture", "function-calling", "reflexion"]
-estimatedMinutes: 10
-summary: "Agent=Model+Harness,5%loop 95%infra"
-widgets: []
-updated: "2026-05-28"
+estimatedMinutes: 11
+summary: "Agent = Model + Harness — 5% 是循环、95% 是基础设施"
+widgets: ["HarnessStateMachine"]
+updated: "2026-05-29"
+references:
+  - id: lopopolo2026harness
+    authors: "Lopopolo, P. (OpenAI)"
+    year: 2026
+    title: "Harness Engineering: The Model is Only Half the Story"
+    venue: "OpenAI Engineering Blog"
+    url: "https://openai.com/blog/harness-engineering"
+  - id: fulton2025codex
+    authors: "Fulton, J."
+    year: 2025
+    title: "Inside the Agent Harness: Reading Codex Source Code"
+    venue: "jonathanfulton.com"
+    url: "https://jonathanfulton.com/codex-harness"
+  - id: anthropic2024writingtools
+    authors: "Anthropic"
+    year: 2024
+    title: "Writing Tools for Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/writing-tools-for-agents"
 ---
 
 # Harness Engineering 总论
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[multi-agent-debate]] 末尾留了一个观察：Anthropic 那篇多 agent 文章**有一半篇幅在讲生产可靠性** — 不是讲算法，而是讲 checkpoint、tracing、rainbow 部署、错误恢复。
+
+说明前面 19 篇讲的**算法**只是 agent 的一半。另一半是**让这些算法稳定跑起来的工程实体** — 也就是 [[agent-architecture]] 里讲过的 **Harness**。
+
+cluster 5 接下来 5 篇（包括本篇）整体在做一件事：**把前面 19 篇讲过的算法逐一落到代码** — 用 Claude Code 和 OpenAI Codex 这些真实产品的内部结构作为 case study。这一篇先立总论：harness 是什么、为什么是工程实体的关键。
+
+## 1. 把 [[agent-architecture]] 的等式请回来
+
+[[agent-architecture]] 里讲过两套切法 — 学界的"三件套"和工业界的 **Model + Harness**：
+
+> **Agent = Model + Harness**
+>
+> - **Model**：发动机。GPT / Claude / Gemini 本身
+> - **Harness**：模型外的一切 — 主循环、工具调度、上下文管理、子 agent 编排、错误恢复、审批沙箱
+
+这套切法是 OpenAI 工程师 Lopopolo 在 *Harness Engineering*<Cite id="lopopolo2026harness" /> 里正式命名的。Jonathan Fulton 逐行读完 Codex 源码后，给这套讲义贡献了一句最该记住的话：
+
+> [!important] Harness 工程的核心公式
+> Fulton<Cite id="fulton2025codex" />：
+>
+> > **The loop is trivial; the infrastructure is everything.** Building an agent is **5%** "call the model in a loop" and **95%** context management, tool execution, sandboxing, and error handling.
+> >
+> > 循环是 trivial 的，基础设施才是全部。做一个 agent，5% 是 "在循环里调模型"，95% 是上下文管理、工具执行、沙箱、错误处理。
+
+也就是说 — 前面 19 篇文章讲的内容（ReAct、context engineering、tool design）严格说只占 agent 工程量的 5%。剩下 95% 是 harness。
+
+## 2. 证据：两个顶级产品的主循环都是 ReAct
+
+Claude Code 和 OpenAI Codex 是目前最强的两个 coding agent。它们的主循环长什么样？
+
+**Claude Code 的 `nO` 主循环**（PromptLayer 逆向工程）：
+
+```python title="Claude Code nO 主循环 · 简化版"
+while True:
+    response = llm(history, tools=available_tools)
+    if not response.tool_calls:
+        # 模型只输出文本,没调工具 → 循环结束,等用户下一句
+        break
+    for call in response.tool_calls:
+        result = execute_tool(call)
+        history.append(response)
+        history.append(result)
+```
+
+**OpenAI Codex 的 `turn.rs` 主循环**（Fulton 读 Rust 源码）：
+
+```rust title="Codex turn.rs · 简化版"
+while needs_follow_up {
+    // 1. 收集对话历史
+    let messages = collect_history();
+    // 2. 带着 tools 发给 LLM
+    let response = llm.call(messages, &tools);
+    // 3. 处理回复
+    if response.has_tool_call() {
+        let result = execute(response.tool_call);
+        history.append(response);
+        history.append(result);
+        // 继续下一轮
+    } else {
+        // 只有文本输出,本轮结束
+        needs_follow_up = false;
+    }
+}
+```
+
+> [!note] 这就是 [[react-core]] 那个 ReAct 循环，一个字没变
+> 两个最强的 coding agent，主循环都是 [[react-core]] 讲过的 `while: 模型决定下一步 → 执行拿 ground truth → 记进历史`。
+>
+> 这件事的意义：**每个产品级 agent = 一个 ReAct loop + 一大堆 harness**。
+>
+> 前面 19 篇教的是那 5%（loop 里填什么决策）；cluster 5 剩下的几篇讲的是那决定成败的 95%（让 loop 在真实生产环境里跑得起来）。
+
+## 3. Harness 这台机器的 3 大主件
+
+把 harness 当一台机器拆开，**核心是 3 块**：
+
+```text title="Harness 主件骨架 · 先记住这 3 块"
+   ┌── 用户 ──┐
+   └─────┬────┘
+         ▼
+   ① 请求构造  ← 把 system 指令、history、工具集组织成一次 LLM 请求
+         ▼
+   ② ReAct 主循环 + Context Manager
+       (= [[react-core]] 那个 while loop + 一层负责 context 管理的封装)
+         ▼
+   ③ 工具执行流水线  ← 拿到 tool_call 后真去做事 (沙箱、超时、回填)
+         ▼
+       回到 ②
+```
+
+这 3 块就是 [[react-core]] 那 6 行裸 loop 升级成生产 agent 后**最主要的工程外壳**。
+
+每一块里还有一些更小的部件 — `h2A`（实时插话）、TodoWrite（规划）、MCP（动态发现工具）、Guardian（安全）、子 agent — 它们会在后面 3 篇里**穿插登场**，对应这张主件图的位置：
+
+- [[harness-loop]] 拆 ① **请求构造** + 主循环外壳（流式、超时、`h2A`）
+- [[harness-tools-context]] 拆 ② **Context Manager**（compaction、token 截断）+ ③ **工具流水线**（Codex 6 步）+ TodoWrite + MCP
+- [[harness-agents-safety]] 拆**子 agent** 和 **Guardian 安全** 两个跨主件的能力
+
+可以拖动下面的状态机看一个完整 harness 一轮内部的状态流转：
+
+<HarnessStateMachine />
+
+每个具体部件都对应前面某一节算法的工程实体 — 整本讲义在 harness 这里**显形成代码**。
+
+## 4. 设计哲学：先做最简单的事
+
+Claude Code 的核心设计原则，几乎是 [[workflow-vs-agent]]（简单优先）+ [[multi-agent-debate]]（单线程）的产品化：
+
+> "do the simple thing first" — regex（Grep）而非 embeddings 做搜索；Markdown 文件而非数据库做记忆；扁平消息历史而非复杂线程；单循环而非 agent 集群。
+
+为什么 Claude Code 敢用 regex 搜索而不上向量检索？因为 **"Claude 对代码结构理解够深，能自己写出复杂的 regex"** — 模型变强了，harness 反而能更简单。
+
+这呼应 [[context-engineering]] 那条工程纪律 — **"do the simplest thing that works"**。但 harness 这一层把它推到极致：**很多看起来要花哨工程的地方，模型自己就能搞定**。你的任务不是给 agent 装一堆机制，是让它有简单可靠的工具 + 一个干净的运行环境。
+
+## 5. Harness 这一层的核心信条
+
+Harness Engineering 作为一门**学科**，最深的信条是：
+
+> **瓶颈往往是环境，不是模型**。
+
+这条信条在 [[aci]] 那篇里已经看到一个标志性实证 — SWE-bench 任务上**只改了 agent 编辑文件的工具接口**、模型一字没动，准确率从 6.7% → 68.3%。
+
+这个数字不是孤立的。它是 harness 工程**整个学科存在的理由** — 同一个模型在不同 harness 下表现可能差一个数量级。给你一个直接的实操建议：
+
+> [!tip] Debug agent 的第一原则
+> 当一个 agent 表现差，**先查 harness，别急着换模型**。
+>
+> - 工具格式对不对（[[aci]]）
+> - context 怎么截断（[[long-running-techniques]]）
+> - compaction 时机对不对（[[context-fixes-evidence]]）
+> - 工具描述准不准
+>
+> 这些往往是最高 ROI 的修复点。**把同一个模型在不同 harness 下的表现差异跑一遍，你就真懂 harness 是什么了**。
+
+## 6. Harness 的最底层 = 推理引擎的最上层
+
+看 Context Manager 暴露给模型 API 的几个旋钮 — Codex Responses API 的 **`prompt_cache_key`** / context diffing / `parallel_tool_calls` / `reasoning_effort`。这些 harness 旋钮直接踩在推理引擎（vLLM / SGLang）的地盘上 — KV cache 怎么存、怎么复用、怎么分页（PagedAttention），正是 infra 层在干的事。
+
+cluster 5 最后一篇 [[prompt-caching-infra]] 会沿着 `prompt_cache_key` 这根线，把整套讲义从应用层正式领到 infra 层的门口。
+
+---
+
+下一篇 [[harness-loop]] 从最基础的部件开始 — 请求构造（分层 system 指令、结构化历史用 `call_id` 链工具调用、动态工具集）+ 主循环本身的骨架（处理超时、错误、流式输出）。这是 [[react-core]] 的"裸 loop"在生产环境下被加上完整工程外壳的样子。

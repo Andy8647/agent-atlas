@@ -4,12 +4,191 @@ slug: "harness-agents-safety"
 cluster: "multi-agent-production"
 order: 23
 prerequisites: ["harness-tools-context"]
-estimatedMinutes: 10
-summary: "Controlled sub-agent,Guardian,MCP"
+estimatedMinutes: 11
+summary: "受控子 agent + Guardian 三件套 — multi-agent-debate 判决书写进代码"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: cognition2025dontbuild
+    authors: "Walden Yan (Cognition)"
+    year: 2025
+    title: "Don't Build Multi-Agents"
+    venue: "Cognition AI Blog"
+    url: "https://cognition.ai/blog/dont-build-multi-agents"
+  - id: anthropic2024writingtools
+    authors: "Anthropic"
+    year: 2024
+    title: "Writing Tools for Agents"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/writing-tools-for-agents"
 ---
 
 # 子 Agent 与安全
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[harness-loop]] 和 [[harness-tools-context]] 拆完了主循环、工具流水线、Context Manager 三大主件。这一篇把 harness 最后两个**决定 agent 能不能真的在生产里跑**的部件拆完：
+
+- **部件 ⑥ 受控子 agent** — [[multi-agent-debate]] 那场争论的产品化判决写进代码
+- **部件 ⑦ 安全 Guardian** — 任何能跑命令的 agent 必须有的审批 / 沙箱 / 审计三件套
+
+读完这一篇，cluster 5 关于 "harness 是什么、怎么搭" 就完整了。
+
+## 1. 受控子 Agent：Claude Code 的产品判决
+
+[[multi-agent-debate]] 里讲过一场对撞 — Anthropic 支持多 agent、Cognition 反对。Cognition 的关键观察是：
+
+> Claude Code 确实会 spawn 子 agent，但**从不并行写代码** — 子 agent 通常只负责"回答一个明确的问题"，不写代码。Claude Code 是"故意保持简单"。
+
+那 Claude Code 实际怎么处理子 agent？
+
+### Claude Code 的子 agent 三条约束
+
+1. **最多一层分支** — 子 agent 不能再生子 agent（防止递归爆炸）
+2. **子 agent 不能并行写代码** — 只回答明确的查询问题（比如 "搜一下 codebase 里所有用了 X 的地方"）
+3. **子 agent 的输出**作为一个普通 tool 的 result 回填进主 agent 的 history
+
+```text title="Claude Code 子 agent 架构"
+主 agent (Opus 或 Sonnet):
+  ├── 主循环, ReAct, history 完整
+  ├── 调子 agent (作为一个特殊 tool):
+  │     spawn_subagent(task="搜索 'AuthService' 的所有 import")
+  │     ├── 子 agent 在干净 context 里跑
+  │     ├── 用 grep / read_file 等工具
+  │     └── 回传摘要: "找到 12 处, 列表如下..."
+  └── 收到摘要, 作为 tool result 回填, 继续主循环
+
+约束:
+  - 子 agent 不能 spawn_subagent (递归深度上限 1)
+  - 子 agent 没有 write_file 等修改文件的权限
+  - 子 agent 用 Sonnet (便宜+快), 主 agent 用 Opus (强但贵)
+```
+
+### 这是 [[multi-agent-debate]] 那场争论的判决书
+
+注意这三条约束**精准命中** Cognition 的反对论点：
+
+| Cognition 的担忧 | Claude Code 的对策 |
+|---|---|
+| 多 agent 之间决策互相冲突 | 子 agent 不写代码，只回答事实查询 |
+| 主 agent 看不到子 agent 的过程 | 子 agent 强制生成"蒸馏摘要"回传，作为普通 tool result |
+| 多 agent 递归爆炸难控 | 硬约束最多一层 |
+| 子 agent 各自带不同 context 风格冲突 | 子 agent 只接受**明确、可独立完成**的查询任务 |
+
+Cognition 说"默认单线程"，Anthropic 说"多 agent 可以管"。Claude Code 给的产品答案是 **"绝大多数情况下单线程 + 在特定查询类任务上有受控子 agent"** — 这是两派立场在工程上的合理中点。
+
+> [!important] harness 是抽象判断落地的地方
+> [[multi-agent-debate]] 那场对撞看似是理念之争，但**它的判决书最终写在 harness 代码里**。Claude Code 用 "最多一层 + 只做查询不写代码" 的约束选了 Cognition 那派的"故意保持简单"。
+>
+> 这正是 [[harness-overview]] 那条 "do the simple thing first" 设计哲学的具体例子 — **当你不确定该选哪派理论，看最强产品怎么选**。
+
+### 子 agent 为什么仍有价值
+
+虽然约束这么严，子 agent 还是被保留了。为什么？两个理由：
+
+**理由 1：避免主 agent context 被搜索噪音淹没**
+
+主 agent 调 `grep` 搜某个符号，可能返回 200 行结果，agent 只在意其中 5 行。把这 200 行直接进主 history 会污染未来 N 轮的 context。
+
+用子 agent 做这件事：
+
+- 子 agent 在自己的小窗口里**消化 200 行**
+- 给主 agent **回传 "找到 12 处，分别在以下 3 个文件"** 这种 2K 摘要
+- 主 agent 的 context 永远保持精简
+
+这是 [[long-running-techniques]] 里 sub-agent 那条"用干净窗口换 context 容量"的工程实现。
+
+**理由 2：模型选择上可以差异化**
+
+主 agent 用 Opus（最强，处理复杂决策）；子 agent 用 Sonnet（便宜、快，做查询足够）。这种**"高低搭配"**省了一大笔成本，又不损失能力。
+
+## 2. 安全 Guardian：能跑命令的 agent 必须有的三件套
+
+**任何能执行命令的 agent 都必须有审批 + 沙箱 + 审计**。这不是加分项，是 table stakes（底线）。Claude Code 的安全机制叫 **Guardian**，按风险分三层：
+
+```text title="Claude Code Guardian · 风险分层"
+Level 1: 安全命令 (auto-allowed)
+  - ls, pwd, cat, grep, git status, git log
+  - 文件读取 (read_file)
+  - 在 workspace 内的非破坏操作
+  → 自动放行,不打扰用户
+
+Level 2: 中等风险 (one-time approval)
+  - 文件写入 (在 workspace 内)
+  - npm install, pip install (本地包管理)
+  - 网络访问 (web_fetch)
+  → 弹审批 prompt: "Claude wants to write to auth.py. Allow? [y/N]"
+
+Level 3: 高风险 (always approval + sandbox)
+  - rm, mv (有破坏性)
+  - workspace 外的写入
+  - sudo 命令
+  - 任意 shell_command 执行未知命令
+  → 必须审批 + 在沙箱里执行
+```
+
+### Workspace 内 / 外的边界
+
+这条边界是 Guardian 设计的核心。Claude Code 默认把当前项目目录认作 **workspace** — agent 在 workspace 内**自由读写不打扰用户**（除了 Level 3 的破坏性操作）；任何**workspace 外的写**或者**外网请求**都要审批。
+
+```text title="Workspace 边界 · 用户的"信任半径""
+workspace = ~/projects/my-app/
+   ├── src/         ← agent 自由读写 (Level 2 自动审批一次)
+   ├── tests/       ← 同上
+   ├── package.json ← 同上
+   └── ...
+
+workspace 外:
+   ├── ~/.ssh/      ← 写入必须审批 (Level 3)
+   ├── ~/Documents/ ← 同上
+   └── /            ← 系统目录,严禁
+```
+
+这是一个非常聪明的 UX 设计 — **agent 的活动范围 = 用户的信任半径**。用户开 Claude Code 时已经隐含说 "我信任 agent 在这个 repo 里工作"，所以在 repo 内不打扰；离开这个范围就要重新征得用户同意。
+
+### 沙箱执行（重申一遍 [[harness-tools-context]] 的细节）
+
+Level 3 的命令必须在**沙箱**里跑：
+
+| 平台 | 沙箱机制 |
+|---|---|
+| **macOS** | Seatbelt (`sandbox-exec`) + profile 文件 |
+| **Linux** | Landlock + seccomp（kernel-level 限制） |
+| **跨平台** | Docker / Firecracker（完整虚拟化） |
+
+沙箱给两个保证：
+
+- **文件系统隔离** — 即使 agent 写了 `rm -rf /`，也只在沙箱内生效，不影响真实系统
+- **网络隔离** — 沙箱可以禁掉网络，防止 agent 给数据外发
+
+### 审计 trail
+
+最后一层 — **所有命令都被 log 下来**：
+
+```text title="Guardian 审计日志样例"
+2026-05-29 14:23:01 [Level 1] read_file('src/auth.py')  ← auto-allowed
+2026-05-29 14:23:15 [Level 2] write_file('src/auth.py', ...)  ← user approved
+2026-05-29 14:24:32 [Level 3] bash('npm publish')  ← user denied
+2026-05-29 14:25:01 [Level 3] bash('rm -rf node_modules')  ← user approved + sandbox
+```
+
+审计 log 让用户**事后能查 agent 干了什么**。出问题时这是 forensics 的唯一依据。
+
+## 3. 受控自主性 — Harness 的真正设计哲学
+
+把子 agent 三条约束 + Guardian 三级审批拼起来看，是同一个工程哲学：**给模型自主性，但在明确的边界里**。这是 agent 从 demo 走到生产的关键 — 也是 [[workflow-vs-agent]] 那条 "用灵活性换可靠性" 在 harness 层再往回拉一档。
+
+## 4. 回看 [[harness-overview]] 那张主件图
+
+到这里 harness 三篇拆完了。回去看 [[harness-overview]] §3 那张 3 大件骨架图，**现在每个位置都填上了具体内容**：
+
+- ① **请求构造** = [[harness-loop]] 的 4 层 system 指令 + 结构化 history + 动态工具集
+- ② **Context Manager + ReAct 循环** = [[harness-tools-context]] 的自动 compaction、token 截断、context diffing + TodoWrite 常驻规划
+- ③ **工具流水线** = [[harness-tools-context]] 的 Codex 6 步（解析 / 权限 / 沙箱 / 抓输出 / 截断 / 回填）+ MCP 动态发现
+- 跨主件的能力 = 本篇的**受控子 agent**（[[multi-agent-debate]] 那场争论的判决书）+ **Guardian 安全**（任何能跑命令的 agent 必须有）
+
+前面 19 篇讲的所有算法都在这张表里找到位置 — 这就是 cluster 5 这 4 篇 harness 文章的全部工作。
+
+---
+
+cluster 5 还有最后两篇 — 但视角从"agent 怎么搭"转到**"agent 搭好后怎么知道它真的够好"**。
+
+下一篇 [[evaluation]] 讲一个被严重忽略的概念 — **一致性 vs 平均成功率**。τ-bench 给的实证：最强的 GPT-4o agent 在零售场景上**平均成功率 > 60%**，但**让它把同一个任务连续做 8 次都对的概率 < 25%**。"平均能跑"对生产来说远远不够。

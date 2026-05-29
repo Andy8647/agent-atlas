@@ -4,12 +4,193 @@ slug: "multi-agent-debate"
 cluster: "multi-agent-production"
 order: 19
 prerequisites: ["reflexion", "context-engineering"]
-estimatedMinutes: 10
-summary: "Anthropic vs Cognition: rot vs fragmentation"
+estimatedMinutes: 13
+summary: "Anthropic +90.2% vs Cognition「别建多 agent」 — 两派其实没矛盾，藏的变量是耦合度"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: anthropic2024multiagent
+    authors: "Anthropic"
+    year: 2025
+    title: "How we built our multi-agent research system"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/engineering/multi-agent-research-system"
+  - id: cognition2025dontbuild
+    authors: "Walden Yan (Cognition)"
+    year: 2025
+    title: "Don't Build Multi-Agents"
+    venue: "Cognition AI Blog"
+    url: "https://cognition.ai/blog/dont-build-multi-agents"
 ---
 
 # 多 Agent 大辩论
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[context-fixes-evidence]] 里 Context Quarantine（隔离）这条治法效果惊人 — Anthropic 多 agent 架构比单 agent **+90.2%**。一个自然的念头：**那是不是该尽量上多 agent？**
+
+但这套讲义里出现了**唯一一场正面对撞** — 两篇立场相反的工程博客**发布只差一天**：
+
+- **支持派**：Anthropic *How we built our multi-agent research system*<Cite id="anthropic2024multiagent" />（2025-06-13）
+- **反对派**：Cognition *Don't Build Multi-Agents*<Cite id="cognition2025dontbuild" />（2025-06-12）
+
+这一篇先把两边讲透，然后给一个判断：**它们其实没真正矛盾** — 只是在**不同的任务结构**上各自正确。看懂这一点比记住任何一方的结论都重要。
+
+## 1. 支持派：Anthropic 的 Orchestrator-Worker
+
+Anthropic 的 Research 功能用的是 **orchestrator-worker（编排者-工人）** 架构 — 这就是 [[workflow-vs-agent]] 里讲的 5 种 workflow 模式中的第 4 种，但现在升级成 agent 形态：
+
+```text title="Anthropic 多 agent 研究系统"
+        用户 query
+            │
+   ┌────────▼─────────┐
+   │  Lead Agent       │  ① 分析问题、定策略
+   │  (Opus 4)         │  ④ 综合所有 findings, 决定是否再派
+   └───┬───────┬───────┘
+       │       │  ② 并行派出多个子 agent, 各带「干净的独立窗口」
+   ┌───▼──┐ ┌──▼───┐
+   │Sub 1 │ │Sub 2 │  ③ 各自独立搜索、用 interleaved thinking 评估、回传 findings
+   │(Sonnet)(Sonnet)
+   └──────┘ └──────┘
+            │
+   ┌────────▼─────────┐
+   │  CitationAgent    │  ⑤ 给所有结论配上引用出处
+   └──────────────────┘
+```
+
+### 为什么有效
+
+Anthropic 给了一句点睛的话：
+
+> **The essence of search is compression.**（搜索的本质是压缩。）
+
+子 agent 在各自独立的 context 窗口里**并行探索问题的不同侧面**，把海量语料**压缩**成最关键的 token 回传给 lead。每个子 agent 还提供 **separation of concerns（关注点分离）** — 独立的工具、prompt、探索轨迹 — 降低 path dependency（路径依赖）。
+
+**数字**：Opus 4 当 lead + Sonnet 4 当子 agent，在内部 research eval 上比单个 Opus 4 高 **90.2%**。
+
+### 但它"真正"有效的原因，Anthropic 自己说得很诚实
+
+别被 90.2% 冲昏头。看 Anthropic 自己给的机制解释：
+
+> [!important] 多 agent 为什么赢：本质是"花掉了足够多的 token"
+> Anthropic 原话：**"Multi-agent systems work mainly because they help spend enough tokens to solve the problem."**
+>
+> 在 BrowseComp 评测上，**单是 token 用量就解释了 80% 的性能方差**（另外两个因素是工具调用次数和模型选择）。
+>
+> 多 agent 的核心价值是用多个独立窗口把"可用的 token 预算 / 并行推理容量"摊大了。这正是 [[context-fixes-evidence]] 里 Context Quarantine "用独立窗口换更多 context 容量" 的另一种说法。
+>
+> 代价：多 agent 烧 token **~15×**（单 agent 才 ~4×）于普通 chat。**只有任务价值足够高，才付得起这笔账**。
+
+### Anthropic 自己划的边界
+
+Anthropic 明确说多 agent **不适合**两类任务：
+
+- 需要所有 agent **共享同一份 context** 的
+- agent 之间有大量**依赖**的
+
+原话特别值得记，因为这是和"反对派"和解的关键：
+
+> Most **coding tasks** involve **fewer truly parallelizable tasks than research**, and LLM agents are not yet great at coordinating and delegating to other agents in real time.
+>
+> 大多数编码任务比研究**可并行性更差**，而且 LLM agent 目前还做不好实时协调和委派给其他 agent。
+
+也就是说 — Anthropic 自己承认 **coding 不如 research 可并行**。记住这一点，因为下一节 Cognition 正好用 coding 例子开炮。
+
+## 2. 反对派：Cognition 的两条原则
+
+Cognition（做 Devin 的）开篇就点名 — OpenAI Swarm、Microsoft AutoGen 推的多 agent 架构**是错的方向**。它的全部论证压在两条原则上：
+
+> **原则 1：Share context**（共享上下文）— 而且要共享**完整的 agent 轨迹**，不只是单条消息。
+>
+> **原则 2：Actions carry implicit decisions**（行动隐含决策）— 互相冲突的决策 → 糟糕的结果。
+
+### Flappy Bird 例子（务必记住）
+
+Cognition 用了一个非常具体、几乎是寓言级的例子：
+
+> **Task**：做一个 Flappy Bird 克隆。拆成两个子任务：
+> - **Subtask 1**：做一个带绿色管道和碰撞箱的滚动背景
+> - **Subtask 2**：做一只能上下移动的鸟
+>
+> **结果**：
+>
+> - 子 agent 1 **误解了**任务，做了一个**像超级马里奥**的滚动背景
+> - 子 agent 2 做的鸟既不像游戏素材、动起来也不像 Flappy Bird
+> - 最后那个负责合并的 agent，面对的是**两份各自跑偏的成果**
+
+你可能想：**把原始任务也抄给两个子 agent 不就行了**？这是满足 Cognition 的原则 1（共享 context）。
+
+Cognition 说还不够：
+
+> 这次你可能得到一只鸟和一个背景，但**视觉风格完全不搭** — 因为子 agent 1 和 2 看不到对方在做什么，它们的行动**基于事先没说定的、互相冲突的假设**。
+
+这就是原则 2：**每个行动都隐含了一堆没明说的决策（用什么画风、什么物理手感）**，并行的 agent 各自隐含了冲突的决策，合起来必然打架。
+
+### Cognition 的处方：默认单线程
+
+Cognition 的结论：**默认排除任何违反原则 1 & 2 的架构**。最简单的实现是 **single-threaded linear agent**（单线程线性 agent） — context 连续，谁也不会漏看谁的决策。
+
+任务真的长到爆窗口？引入一个**专门做上下文压缩的模型**（[[long-running-techniques]] 里讲的 compaction） — Cognition 甚至 fine-tune 了一个小模型干这事。
+
+> [!note] Cognition 对 Claude Code 的精彩观察
+> Cognition 指出：Claude Code 确实会 spawn 子任务，但**从不并行写代码** — 子 agent 通常只负责"回答一个明确的问题"，不写代码。
+>
+> 为什么？因为子 agent 缺主 agent 的 context，做不了"回答明确问题"之外的事；真要并行跑多个，它们会给出冲突的结果。
+>
+> **Claude Code 是"故意保持简单"** — 这个观察很犀利：连最强的 coding agent 都在克制使用多 agent。
+
+## 3. 一个判断：它们没矛盾，藏的变量是「耦合度」
+
+很多人把这两篇当成"神仙打架，必须选边站"。这是误读 — **它们其实在说同一套物理，只是工作在不同区间**。
+
+藏的关键变量是：**子任务之间是不是互相耦合（coupled）**。
+
+| | Anthropic（支持） | Cognition（反对） |
+|---|---|---|
+| **任务域** | **只读研究** — 查信息 | **造东西** — 写代码 / 做游戏 |
+| **子任务关系** | 独立、可加：查 A 公司董事会 不依赖 B 公司；findings 收集起来就行 | **强耦合**：鸟和背景必须风格一致；子任务 2 的对错依赖子任务 1 的决策 |
+| **并行的后果** | 各管一摊、互不干扰 → +90% | 各自隐含冲突决策 → 合并即灾难 |
+| **该用** | **多 agent**（独立窗口 = 更多并行 token 容量） | **单线程**（共享 context = 决策不冲突） |
+
+### 一句话决策规则（背这个，别背两方结论）
+
+> [!tip] 子任务耦合度判断
+> 在动手设计架构之前问一个问题：**我的子任务之间，会不会"互相隐含决策"？**
+>
+> - **不会**（独立探索、结果可加、只读）→ 多 agent 划算（前提：任务价值付得起 ~15× token）
+> - **会**（每个动作都为别人定了调、结果要拼成一个连贯整体）→ 老老实实单线程 + 好好做 [[context-engineering]]
+
+### 两篇其实彼此印证，不是对立
+
+注意两个细节：
+
+- **Anthropic 自己说**"coding 不如 research 可并行" — 这正是 Cognition 用 coding 例子的原因。两边对"coding 该单线程"**意见一致**
+- **Anthropic 的工程 tip** "subagent 把输出写到文件系统、只回传轻量引用，避免 game of telephone（传话游戏失真）" — 这**就是在解决** Cognition 的原则 1（共享完整轨迹、别只传单条消息）
+
+两边其实在同一张地图上画了不同的区域。
+
+## 4. 接回 cluster 4：多 agent 是在两种病之间换毒药
+
+用 cluster 4 的框架收一下，这是最深的一层理解：
+
+> [!warning] 多 agent = 把 Context Quarantine 用到极致
+> Quarantine 的超能力（干净窗口、避开单 agent 的 [[context-failure-modes]] 里的 4 种崩法）是真的。但它有 Cognition 点名的代价 —
+>
+> **你把 context 隔离得太干净，agent 之间看不到彼此的决策 → 跨 agent 的 Context Clash**（[[context-failure-modes]] 的第 4 种崩法）。
+>
+> 本质上：**多 agent 用"单 agent 的上下文腐烂"换"跨 agent 的上下文碎片化"**。
+>
+> 你选哪种毒药，取决于任务的耦合度。强耦合任务，碎片化代价 > 腐烂代价，单线程赢；独立任务，反之。**没有银弹，只有 trade-off 的位置**。
+
+## 5. 这一篇对后面 cluster 5 的影响
+
+到这里这套讲义讲完了 **"用什么算法 / 什么结构"** —
+
+- 单 agent 范式（[[react-core]] / [[plan-and-solve]] / [[tree-of-thoughts]] / [[reflexion]]）
+- 三件套（Planning + Memory + Tool Use）
+- Context 工程（cluster 4 全部）
+- 多 agent 架构（本篇）
+
+但 Anthropic 那篇多 agent 文章**有一半篇幅在讲生产可靠性** — agent 是有状态的、错误会复合、要 checkpoint、要 rainbow 部署、要全链路 tracing、要能从断点恢复……
+
+也就是说：**ReAct 的循环、工具的调度、compaction、子 agent 的编排、出错重试 — 这一切都得被真正实现出来、接成一台能稳定运转的机器**。
+
+这台"模型外面的机器"就是 [[agent-architecture]] 里讲过的 **Harness**。从下一篇 [[harness-overview]] 开始，cluster 5 剩下 6 篇都在拆这台机器 — 用 Claude Code / OpenAI Codex 这些真实产品的内部结构，把前面 19 篇讲过的算法**逐一落到代码**。

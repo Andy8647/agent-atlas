@@ -4,12 +4,244 @@ slug: "prompt-caching-infra"
 cluster: "multi-agent-production"
 order: 25
 prerequisites: ["harness-loop", "context-engineering"]
-estimatedMinutes: 10
-summary: "三层缓存,PagedAttention→RadixAttention"
+estimatedMinutes: 13
+summary: "KV cache → PagedAttention → RadixAttention — 应用层和 infra 层会师的接缝"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: kwon2023vllm
+    authors: "Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J., Zhang, H., & Stoica, I."
+    year: 2023
+    title: "Efficient Memory Management for Large Language Model Serving with PagedAttention"
+    venue: "SOSP 2023"
+    url: "https://arxiv.org/abs/2309.06180"
+  - id: zheng2024sglang
+    authors: "Zheng, L., Yin, L., Xie, Z., Sun, C., Huang, J., Yu, C. H., Cao, S., Kozyrakis, C., Stoica, I., Gonzalez, J. E., Barrett, C., & Sheng, Y."
+    year: 2024
+    title: "SGLang: Efficient Execution of Structured Language Model Programs"
+    venue: "NeurIPS 2024"
+    url: "https://arxiv.org/abs/2312.07104"
+  - id: anthropic2024promptcaching
+    authors: "Anthropic"
+    year: 2024
+    title: "Prompt Caching with Claude"
+    venue: "Anthropic Engineering Blog"
+    url: "https://www.anthropic.com/news/prompt-caching"
 ---
 
 # 推理成本与 Prompt Caching
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+[[evaluation]] 末尾留了一根成本线 — τ-bench 跑一遍约 $200，**价格的 95.9% 花在 input prompt 上** — 因为每轮都重发那段又长又静态的 system prompt（领域政策 + 全部工具定义）。
+
+这一节顺着这根成本线，讲清 **prompt caching**，然后把整套讲义正式领到 **"应用层 ↔ infra 层"的接缝** — 一个新方向的开头。
+
+这是这套讲义的**收尾**：既给 agent 应用层画句号，也给你的下一站（vLLM / SGLang 推理引擎）开个头。
+
+## 1. 成本问题：静态前缀，每轮重算一遍
+
+回想 [[react-core]] 那个 agent 主循环 — 每一轮你把**整个历史**发给模型。但这历史里有一大块**每轮都一模一样**：
+
+```text title="一轮 LLM 调用 prompt 的组成"
+[ system prompt (角色 + 政策) ]     ← 每轮完全相同 (静态)
+[ 工具定义 × N ]                   ← 每轮完全相同 (静态)
+[ few-shot 例子 ]                  ← 每轮完全相同 (静态)
+[ 对话历史 ...................... ] ← 缓慢增长
+[ 这一轮的用户消息 / 工具返回 ]      ← 每轮都变 (动态)
+```
+
+模型每轮都要把那段静态前缀**从头重新计算一遍**（算它的 attention、生成它的中间表示）。这就是 [[evaluation]] 那 95.9% 成本的来源 — **你在反复为同一段不变的文字付费**。
+
+**Prompt caching** 的想法朴素得像废话：
+
+> 那段不变的前缀，**算一次、把结果存下来、下次直接复用**，只算新增的部分。
+
+一个好比喻：像餐厅的**备菜（prep work）** — 不是每来一单都从头洗切，而是把稳定的备料做好反复用。
+
+> [!note] Prompt caching 和 RAG / memory 是两回事
+> 别混淆：
+>
+> - **RAG / memory**（[[memory-basics]]）是 "**往 context 里放什么内容**"
+> - **Prompt caching** 是 "已经定下来的内容，**怎么不重复计算**"
+>
+> 一个管"塞什么"，一个管"塞过的别再算"。两者正交，可叠加。
+
+## 2. 什么能缓存：三层架构 + 什么会破坏缓存
+
+### 三层模型（决定你怎么组织 prompt）
+
+| 层 | 内容 | 缓存价值 |
+|---|---|---|
+| **Layer 1: 稳定地基** | 系统角色、语气规则、**工具契约**、政策、任务模板 | **最佳缓存目标**（几乎不变） |
+| **Layer 2: 会话框架** | 工作流类型、workspace 元数据、用户画像、长期目标 | 偶尔变，可缓存 |
+| **Layer 3: 当轮上下文** | 最新用户消息、检索片段、工具输出、审批决定 | 几乎每轮变，**不缓存** |
+
+> [!important] 一个直接的工程纪律：稳定的放前面、动态的放后面
+> 缓存命中靠的是**前缀完全匹配**。所以你必须把 Layer 1（稳定）放在 prompt **最前面**、Layer 3（动态）放**最后**。这样可缓存的前缀才是**连续**的。
+>
+> **前缀里只要早早插进一个会变的 token**（比如把当前时间戳放在 system prompt 开头）**整个缓存就废了**。
+>
+> 这正是 [[harness-loop]] 里讲的分层 system 指令（Layer A → D）那条设计的根本原因 — 不是为了"逻辑清晰"，是为了**让前缀的稳定区段连续可缓存**。
+
+### 什么会破坏缓存
+
+| 失败模式 | 后果 | 对应前面 |
+|---|---|---|
+| **政策指令过期（stale）** | 旧缓存键一直复用过时指令，agent "稳定地犯同一个错" | = [[context-failure-modes]] 里 **Poisoning 在缓存层的版本** |
+| **工具 schema 漂移** | prompt 里描述的还是旧 API 参数，和真实工具悄悄脱节 | [[aci]] + [[context-failure-modes]] |
+| **过度缓存检索结果** | 缓存了易变的检索内容 → "自信地用昨天的真相回答" | 又是 Poisoning |
+| **缓存碎片化** | prompt 的微小变体 → 几千个近重复缓存项，复用率崩 | 工程卫生 |
+
+> [!tip] "100% 精确匹配，连空格都算"
+> Anthropic 文档<Cite id="anthropic2024promptcaching" />说缓存要求"完全精确匹配，包括空白字符"。**为什么这么死板**？
+>
+> 因为底层是一棵 **radix 树**（§3 会讲），缓存键是按 token 序列做**相等性匹配**的 — 差一个空格就是另一个 key，命不中。
+>
+> **API 层那条看似苛刻的规则，是 infra 层数据结构透出来的影子**。
+
+## 3. 掀开盖子：KV cache → PagedAttention → RadixAttention
+
+这一节是整套讲义和你下一站 infra 的**正式接缝**。Prompt caching 在 API 层是一个 `cache_control` 开关，但它底下踩着的是推理引擎的核心机制。
+
+### KV cache 是什么
+
+[[context-engineering]] 里讲过 — Transformer 让每个 token 都要 attend 到其他每个 token，$n$ 个 token 就有 $n^2$ 对关系。换个角度看这件事：
+
+> 当模型要生成第 $N+1$ 个 token 时，它必须**回看前 $N$ 个 token 的内部状态** — 否则没法决定下一个写什么。
+>
+> 如果每生成一个 token 就把前 $N$ 个的状态从头算一遍，整个生成过程是 $O(N^2)$ — 第 1 个 token 算 1 步、第 2 个算 2 步、… 第 1000 个算 1000 步。
+
+KV cache 解决这个问题。模型在 attention 里给每个 token 算出来的两组向量（key / value）**存下来**，下个 token 直接复用 — 不必重算前 $N$ 个的 key / value。
+
+```text title="KV cache 在做的事"
+第 1 个 token: 算 K[1], V[1] → 存进 cache
+第 2 个 token: 复用 K[1], V[1], 算 K[2], V[2] → 存进 cache
+第 3 个 token: 复用 K[1..2], V[1..2], 算 K[3], V[3] → 存进 cache
+...
+第 N 个 token: 复用 K[1..N-1], V[1..N-1], 只算 K[N], V[N]
+```
+
+这把生成过程从 $O(N^2)$ 降回 $O(N)$。
+
+KV cache 的三个关键特征：
+
+- **随序列长度线性增长** — 序列 1000 token、模型 32 层、每层 head dim 128，单个序列的 KV cache 就是几十 MB
+- **占大量 GPU 显存** — 服务多个并发请求时，KV cache 是显存的最大消耗源（往往大于模型权重）
+- **动态变化** — 不像模型权重是静态的、可以一次加载，KV cache 每个请求都在动态生成
+
+理解了 KV cache，你就理解了为什么 GPU 显存是 LLM 推理的瓶颈，也就理解了 PagedAttention 和 RadixAttention 各自在解决什么。
+
+### PagedAttention：又是「操作系统」那套
+
+vLLM 团队<Cite id="kwon2023vllm" /> 在 SOSP 2023 提出 **PagedAttention** — 一个让你**第二次拍案叫绝**的设计（第一次是 [[memgpt]] 也用 OS 分页比喻管 context）。
+
+> [!important] [[memgpt]] 的回旋镖：同一个 OS 比喻，这次用在 infra 层
+> 还记得 [[memgpt]] 怎么管**应用层**的 context 吗？— 借**操作系统虚拟内存分页**，context window 当 RAM、外部存储当硬盘。
+>
+> **PagedAttention 把一模一样的比喻用在 infra 层的 KV cache 上**：
+>
+> - 把 KV cache 切成**固定大小的块（页）**
+> - 像 OS 给进程分页内存那样管理
+>
+> 带来两个关键能力：
+>
+> 1. **近乎零浪费** — 不再因为"给每个请求预留一整段连续显存"而碎片化浪费 → 能同时驻留更多缓存前缀
+> 2. **跨请求共享** — 多个请求**共享同一段物理页**来存共享的前缀 KV。所有"共享 system prompt"优化的底层机制就是这个 — **前缀住在共享页里，每个请求只占自己独有后缀的页**
+>
+> 效果：吞吐 **2-4×**。
+>
+> **MemGPT 和 PagedAttention 是同一个 idea 在两个高度的化身** — 这就是 "应用层学透 → 爬 infra" 路线里两层会师的那一刻。
+
+### RadixAttention：prefix 复用的逻辑层
+
+PagedAttention 解决"KV 怎么省着放"。SGLang<Cite id="zheng2024sglang" /> 团队在 2023-12 提出 **RadixAttention**，解决"**跨请求怎么自动复用前缀**"：
+
+```text title="RadixAttention · 用 Radix 树自动复用前缀 KV"
+请求 A: [system_prompt] [tools] [conv_1] [conv_2]
+请求 B: [system_prompt] [tools] [conv_1] [conv_3]
+       └────────────────────────┘
+              共享前缀
+
+RadixAttention 流程:
+1. 请求 A 跑完, KV cache 不丢弃, 存进 radix 树, 以 token 序列为键
+2. 请求 B 来:
+   - 在 radix 树里找最长匹配前缀 → [system_prompt][tools][conv_1]
+   - 复用那段 KV cache (省去重新计算)
+   - 只计算 [conv_3] 这段后缀的 KV
+
+加上 LRU 驱逐策略 + 多租户隔离 → 吞吐 6.4×, 降低 TTFT
+```
+
+**RadixAttention 是现代所有 prompt caching API 的学术祖宗**。Anthropic / OpenAI / Google / DeepSeek 的 prompt caching，本质都是**产品化的 RadixAttention**，各家只是在驱逐策略（TTL）、粒度（token vs breakpoint）、计费（读写倍率 vs 存储时长）、多租户隔离上做差异化。
+
+### 谱系（把这条线记住，它就是 infra 入门的地图）
+
+```text title="prompt caching 谱系 · 你的 infra 入门路径"
+PagedAttention (显存层, 2023-09, vLLM)
+       ↓  在它之上加 "前缀复用逻辑"
+RadixAttention (SGLang, 2023-12)
+       ↓  推到磁盘 + MLA 小 KV cache
+DeepSeek Context Caching (2024-08)
+       ↓  封装成 API 开关
+Anthropic / OpenAI / Google 的 prompt caching (2024-08+)
+```
+
+现代 vLLM（2025+）有自己的 **APC（Automatic Prefix Caching）**，就是 PagedAttention + RadixAttention 式 trie 匹配的合体。
+
+## 4. 全课收束：一条主线，两个高度
+
+恭喜，你走完了 25 篇。最后把整条线收成**一句话 + 一张图**，这是这套讲义真正想让你带走的东西。
+
+### 一句话主线
+
+> **Agent 的几乎所有难题，都是"上下文（context）是有限资源，怎么管好它"的不同侧面**。
+
+顺着这条线回看，25 篇其实在讲同一件事：
+
+| 文章 | 在做的事 |
+|---|---|
+| [[what-is-agent]] / [[workflow-vs-agent]] / [[agent-architecture]] | Agent 是什么 — 在 loop 里管一段不断增长的 context |
+| [[react-core]] / [[plan-and-solve]] / [[tree-of-thoughts]] / [[reflexion]] | 让放进 context 的**推理**更可靠、grounded、能纠错 |
+| [[function-calling]] / [[toolformer]] / [[aci]] | **往 context 里放什么**（以及别放垃圾） |
+| [[memory-basics]] / [[memgpt]] | 长期 vs 短期记忆 — context 装不下时挪到哪 |
+| [[context-engineering]] / [[context-design]] / [[long-running-techniques]] | 管理有限注意力预算的纪律 |
+| [[context-failure-modes]] / [[context-fixes-evidence]] | context 管不好的四种崩法 + 六种治法 |
+| [[multi-agent-debate]] | 用多个干净 context 换并行（代价是碎片化） |
+| [[harness-overview]] / [[harness-loop]] / [[harness-tools-context]] / [[harness-agents-safety]] | 把上面**全部**实现成管理 context 的真实机器 |
+| [[evaluation]] | 怎么知道这套管理真的可靠（pass^k） |
+| 本篇 | context 里**不变的部分别重复算**，落到 infra 是 KV cache 的分页与复用 |
+
+### 一张图：同一个"有限内存管理"问题，出现在两个高度
+
+```text title="同一个智慧, 两个高度"
+应用层 (本课)         "有限的 context window 里该放什么"
+     │                MemGPT 用 OS 分页比喻管它
+     │                context engineering 管注意力预算
+     ▼ ───── 接缝: prompt caching / prompt_cache_key (harness + 本篇) ─────
+Infra 层 (下一站)     "有限的 GPU 显存里 KV cache 怎么放、怎么复用"
+                      PagedAttention 用 OS 分页比喻管它
+                      RadixAttention 管前缀复用
+```
+
+**两层用的是同一套"有限内存管理"智慧，只是一个管 token、一个管显存**。
+
+你已经把上面那层学透了，下面那层等着你。
+
+## 5. 一个诚实的提醒
+
+如果你接下来想往 infra 方向爬（vLLM / SGLang / 自己的推理引擎），这套讲义把"应用层"给你铺平了 — 但别误以为读懂 PagedAttention 的**思想**（OS 分页）就等于会写它的 **CUDA kernel**。
+
+> [!warning] 跨过这道缝需要补的东西
+> 跨过应用 → infra 的接缝，你要补：
+>
+> - **显存模型** — HBM、SRAM、bank conflict
+> - **CUDA kernel** — block / thread / warp、shared memory、coalescing
+> - **Batching 调度** — continuous batching、prefill / decode 分离
+> - **量化与压缩** — INT8 / FP8 / KV cache quantization
+>
+> 这是另一段从零开始的攀登。
+>
+> **好消息是：你现在站在缝的正确一侧，而且知道对面长什么样了**。Infra 学到一半时回头看，应用层这些抽象（context engineering / harness）会用全新的方式向你解释清楚 — 因为你终于看到它们底下在跑什么。
+
+---
+
+回首页看完整 25 节学习树，挑想深入的部分继续往下走。

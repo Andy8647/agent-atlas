@@ -223,8 +223,8 @@ export const treeData: TreeData = {
             "reflexion",
             "context-engineering"
           ],
-          "estimatedMinutes": 10,
-          "summary": "Anthropic vs Cognition: rot vs fragmentation"
+          "estimatedMinutes": 13,
+          "summary": "Anthropic +90.2% vs Cognition「别建多 agent」 — 两派其实没矛盾，藏的变量是耦合度"
         },
         {
           "slug": "harness-overview",
@@ -235,8 +235,8 @@ export const treeData: TreeData = {
             "function-calling",
             "reflexion"
           ],
-          "estimatedMinutes": 10,
-          "summary": "Agent=Model+Harness,5%loop 95%infra"
+          "estimatedMinutes": 11,
+          "summary": "Agent = Model + Harness — 5% 是循环、95% 是基础设施"
         },
         {
           "slug": "harness-loop",
@@ -245,8 +245,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "harness-overview"
           ],
-          "estimatedMinutes": 10,
-          "summary": "Claude Code nO,Codex turn.rs"
+          "estimatedMinutes": 11,
+          "summary": "Claude Code nO + Codex turn.rs — 裸 ReAct loop 在生产环境下的完整工程外壳"
         },
         {
           "slug": "harness-tools-context",
@@ -256,8 +256,8 @@ export const treeData: TreeData = {
             "harness-loop",
             "aci"
           ],
-          "estimatedMinutes": 10,
-          "summary": "6步执行管线,token感知截断"
+          "estimatedMinutes": 12,
+          "summary": "工具执行 6 步流水线 + Context Manager — token 截断、自动 compaction、context diffing"
         },
         {
           "slug": "harness-agents-safety",
@@ -266,8 +266,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "harness-tools-context"
           ],
-          "estimatedMinutes": 10,
-          "summary": "Controlled sub-agent,Guardian,MCP"
+          "estimatedMinutes": 11,
+          "summary": "受控子 agent + Guardian 三件套 — multi-agent-debate 判决书写进代码"
         },
         {
           "slug": "evaluation",
@@ -276,8 +276,8 @@ export const treeData: TreeData = {
           "prerequisites": [
             "harness-loop"
           ],
-          "estimatedMinutes": 10,
-          "summary": "pass@k vs pass^k,τ-bench"
+          "estimatedMinutes": 12,
+          "summary": "pass@k vs pass^k — 平均成功率是发布会指标，一致性才是部署门槛"
         },
         {
           "slug": "prompt-caching-infra",
@@ -287,8 +287,8 @@ export const treeData: TreeData = {
             "harness-loop",
             "context-engineering"
           ],
-          "estimatedMinutes": 10,
-          "summary": "三层缓存,PagedAttention→RadixAttention"
+          "estimatedMinutes": 13,
+          "summary": "KV cache → PagedAttention → RadixAttention — 应用层和 infra 层会师的接缝"
         }
       ]
     }

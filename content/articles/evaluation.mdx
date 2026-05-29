@@ -4,12 +4,191 @@ slug: "evaluation"
 cluster: "multi-agent-production"
 order: 24
 prerequisites: ["harness-loop"]
-estimatedMinutes: 10
-summary: "pass@k vs pass^k,τ-bench"
+estimatedMinutes: 12
+summary: "pass@k vs pass^k — 平均成功率是发布会指标，一致性才是部署门槛"
 widgets: []
-updated: "2026-05-28"
+updated: "2026-05-29"
+references:
+  - id: yao2024taubench
+    authors: "Yao, S., Shinn, N., Razavi, P., & Narasimhan, K."
+    year: 2024
+    title: "τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"
+    venue: "arXiv:2406.12045"
+    url: "https://arxiv.org/abs/2406.12045"
+  - id: liu2023agentbench
+    authors: "Liu, X., Yu, H., Zhang, H., Xu, Y., Lei, X., Lai, H., et al."
+    year: 2023
+    title: "AgentBench: Evaluating LLMs as Agents"
+    venue: "ICLR 2024"
+    url: "https://arxiv.org/abs/2308.03688"
+  - id: zhou2023webarena
+    authors: "Zhou, S., Xu, F. F., Zhu, H., Zhou, X., Lo, R., Sridhar, A., et al."
+    year: 2023
+    title: "WebArena: A Realistic Web Environment for Building Autonomous Agents"
+    venue: "ICLR 2024"
+    url: "https://arxiv.org/abs/2307.13854"
 ---
 
-# 评估: Agent 好不好
+# 评估：Agent 好不好
 
-> 📝 本文内容正在从原有讲义迁移中。请先阅读其他已完成章节。
+到这里你已经能**搭** agent（cluster 1-4 的算法）、能把它**接成一台可靠的机器**（cluster 5 的 harness 部件）。但回想这一路，每一节几乎都在重复同一句潜台词 —
+
+- [[reflexion]]：**自我评估的质量是天花板**，评估看不出的失败，反思救不了
+- [[tree-of-thoughts]] 的 state evaluator 用 LLM 当裁判打分
+- [[aci]] 优化工具，靠的是"搭原型 → 跑评估 → 迭代"
+
+**你没法改进你测不了的东西**。这一篇正面回答最后一个问题：**怎么判断一个 agent 真的好**？
+
+核心会落在一个对真实部署最致命、但很容易被忽略的概念上 — **一致性（consistency）**，而不是平均成功率。
+
+## 1. 为什么 agent 评估特别难
+
+传统软件测试假设确定性：输入 X → 走路径 Y → 出 Z，对一下就行。Agent 砸碎了这个假设。Anthropic 说得最清楚：
+
+> 即使起点完全相同，agent 可能走**完全不同但都合理**的路径到达目标：一个搜 3 个源，另一个搜 10 个；用不同工具找到同一答案。因为我们**事先不知道"正确步骤"是什么**，所以通常没法检查"它有没有照我们规定的步骤走"。
+
+三个连锁难点：
+
+| 难点 | 表现 | 后果 |
+|---|---|---|
+| **路径非确定** | 同样输入，多条合理轨迹 | 不能按"步骤对不对"评 |
+| **输出自由形式** | 研究报告这类没唯一正确答案 | 不能用 exact match |
+| **多轮改状态** | 每个动作改变环境，步步依赖 | 难逐步验证 |
+
+应对的总思路：**评结果（outcome），而非评过程（process）**。过程只要求"合理"即可。
+
+## 2. 三根评估轴
+
+评 agent 通常看三个维度：
+
+| 轴 | 测什么 | 例子 |
+|---|---|---|
+| **Task success** | 最终有没有把活干成 | 端到端成功率 |
+| **Tool-call quality** | 调对工具了吗？参数对吗？调用次数合理吗？ | [[react-failures]] 那 23% search error 就栽在这轴 |
+| **Cost / latency** | 烧了多少 token、跑了多久 | [[multi-agent-debate]] 多 agent 15× token 就是这轴的警报 |
+
+很多人只盯第一轴。但**后两轴决定能不能真正部署** — 一个成功率高但烧钱、又慢的 agent，在生产里照样不能用。
+
+## 3. 最致命的概念：一致性 — τ-bench 的 pass^k
+
+τ-bench<Cite id="yao2024taubench" />（Yao et al., Sierra, 2024 — 作者又是 [[react-core]] / [[reflexion]] 同班人马 Shunyu Yao + Noah Shinn）专门测一件被严重忽略的事：**agent 跑一次成功，不代表它可靠**。
+
+### τ-bench 怎么搭的
+
+它模拟"工具 - agent - 用户"三方互动：
+
+- 一个 **LM 模拟的用户**（用 GPT-4 扮演有特定意图、说话自然的真人用户，且**随机性**让同一请求有不同表述）
+- 一个 agent，带 **领域 API 工具 + 政策文档**（场景：航空改签、零售退换货）
+- 两方多轮对话
+
+三个值得学的设计：
+
+1. **用 LM 模拟用户** — 同一请求每次表述都不同，这正是测一致性的弹药
+2. **End-state evaluation（终态评估）** — 这是 §1 "多轮改状态难评"的漂亮办法：
+   - 不逐轮评，而是**比对对话结束时的数据库状态 vs 标注的目标状态**
+   - reward = (action 对 ∧ output 对) ∈ {0, 1}
+   - 用"客观的数据库状态比对"替代了"主观、有噪声的人工判断"
+3. **必要非充分** — `r=1` 是必要非充分条件。agent 可能没经用户确认就执行了写操作（违反政策但终态对）。**终态对 ≠ 过程合规**
+
+### pass@k vs pass^k：乐观的头条数字 vs 真正该看的数字
+
+> [!important] pass@k 和 pass^k 差一个"帽子"，意思天差地别
+>
+> **pass@k**（社区做代码的标准）：k 次尝试里**至少有一次**成功的概率。测的是 **discovery（发现能力）** — 多采样几次能不能撞出一个解。**乐观指标**（推理时多花算力就能刷高）。
+>
+> **pass^k**（pass-hat-k，τ-bench 提出）：k 次尝试**全部**成功的概率。测的是 **reliability / consistency（可靠性 / 一致性）**。
+>
+> $$\text{pass}^k = \mathbb{E}_{\text{task}}\left[\binom{c}{k} \big/ \binom{n}{k}\right] \quad (\text{n 次里成功 c 次})$$
+
+τ-bench 给的杀手级数字：
+
+> 即使是最强的 GPT-4o function-calling agent，在 τ-retail 上 **pass^1（平均成功率）> 60%**，但 **pass^8 掉到 < 25%**。
+>
+> 翻译：让它把同一个任务**连续做 8 次都对**的概率，**不到四分之一**。
+
+> [!warning] 评估这节最该带走的一句话
+> **pass^1（平均成功率）是发布会上的乐观头条；pass^k（一致性）才是能不能部署的真实门槛**。
+>
+> 一个"平均 60% 能成、但你不知道这次成不成"的客服 agent，**根本不能上线** — 客户体验不能靠抛硬币。
+>
+> 这解释了为什么 demo 惊艳的 agent 一进生产就拉胯：**demo 看的是 pass@k（试几次有一次行），生产要的是 pass^k（每次都得行）**。
+>
+> 评估任何 agent 时**都该跑多次看一致性**，而不是跑一次截图。
+
+### 顺带两个深点
+
+**失败分布**（τ-retail 36 个失败）：
+
+- wrong argument 33.3%
+- partial resolution 25%
+- wrong info 22.2%
+- wrong decision 19.4%
+
+**55% 的失败是"信息 / 参数错"** — 呼应 [[react-failures]] 的 search result error 和 [[context-failure-modes]] 的 Distraction。
+
+**政策消融（高分 ≠ 真守规矩）**：
+
+把领域政策从 system prompt 删掉：
+
+- 规则复杂的 τ-airline 上 GPT-4o 掉 **22.4%**
+- 规则简单的 τ-retail 上只掉 4.4%
+
+意思是 — 在简单域里 agent 是"靠常识蒙对"，**并没真在读政策文档**。**评估要能区分"碰巧对"和"真的按规则做对"**。
+
+## 4. 自由文本怎么评：LLM-as-judge
+
+τ-bench 靠"数据库终态"能客观评。但研究报告、开放问答这类**自由文本没有唯一答案**怎么办？
+
+用 LLM 当裁判 — 这正是 [[tree-of-thoughts]] state evaluator + [[reflexion]] evaluator 那条"让 LLM 当裁判"主线的收口。
+
+Anthropic 踩出来的实操经验：
+
+| 做法 | 为什么 |
+|---|---|
+| **用 rubric（评分量表）** | 让 judge 按维度打分：事实准确性、引用准确性、完整性、来源质量、工具效率 |
+| **单次调用 + 单 prompt + 0.0-1.0 打分 + pass/fail 最稳** | 试过多 judge 分别评各维度，发现"一个 judge 一次调用出一个分"反而最一致、最贴合人类判断 |
+| **从 ~20 个 query 起步** | 早期改动效果巨大（prompt 一调成功率能从 30%→80%），小样本就能看出变化 |
+| **人工抽查兜底** | 人能发现机器看不到的：Anthropic 早期 agent **偏好 SEO 内容农场而非权威但排名低的学术 PDF** — 这种偏差只有人能发现 |
+
+> [!note] 自洽性提醒
+> LLM-as-judge 本身也会错（[[reflexion]] 里那个 "MBPP 假阳性单测 16.3%" 就是裁判失灵）。
+>
+> 所以它和 τ-bench 的"客观终态评估"是**互补**的：
+>
+> - 能客观对答案的，就别用 LLM judge（更可靠）
+> - 只有自由文本不得不用时，才上 judge，并用人工抽查兜底
+>
+> 评估信号的质量，永远是自我改进的天花板。
+
+## 5. 几个该认识的 benchmark
+
+不必深记，知道它们覆盖什么、以及一个关键事实：
+
+| Benchmark | 测什么 | 关键数字 |
+|---|---|---|
+| **AgentBench**<Cite id="liu2023agentbench" />（清华 2023） | 8 个环境（操作系统 / 数据库 / 知识图谱 / 卡牌 / 家务 / 购物 / 网页 / 谜题） | 横向测 agent 通用能力 |
+| **WebArena**<Cite id="zhou2023webarena" />（CMU 2023） | 真实可自部署的网站上完成任务 | **agent 14.41% vs 人类 78.24%** — 巨大的人机差距 |
+| **τ-bench**（Sierra 2024） | 工具 - agent - 用户交互 + 政策遵守 | pass^k 一致性（本节主角） |
+
+> [!tip] WebArena 那个 14.41% vs 78.24% 要记住
+> 它是清醒剂 — 在**真实网页任务**上 agent 离人类还差得远。配合 τ-bench 的 pass^k，你对"agent 现状"该有的判断是：
+>
+> **单次 demo 惊艳，可靠性和真实复杂任务上仍很脆**。
+>
+> 别被发布会带节奏。
+
+## 6. 这一篇通向最后一节的成本线
+
+评估让前面所有"它更好"的论断变得可信 — 但它也算了一笔账。τ-bench 算过：GPT-4o agent + 用户模拟跑一遍 τ-retail，**约 $200**。
+
+更值得注意的是钱花在哪：
+
+> **价格的 95.9% 花在 input prompt 上**。
+
+为什么？因为每轮都要重发那段又长又静态的 system prompt（领域政策 + 全部工具定义）。
+
+这个瓶颈**修法不是改算法，是缓存** — 那段每轮都一样的静态前缀，为什么要反复重新计算？把它的计算结果（KV cache）**缓存**下来复用就行。
+
+这就是 **prompt caching** — 而它正是 [[harness-tools-context]] 里 `prompt_cache_key` / context diffing 在干的事，也是 cluster 5 最后一篇 [[prompt-caching-infra]] 的全部内容。
+
+[[prompt-caching-infra]] 会沿着这根成本线，把缓存机制讲清楚 — 而且它会把整套讲义从应用层正式领到 **infra 层（vLLM / SGLang）** 的门口。这是这套讲义的收尾，也是一个新方向的开头。
